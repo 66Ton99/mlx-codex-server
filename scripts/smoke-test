@@ -45,4 +45,26 @@ response="$(curl -fsS "http://127.0.0.1:${port}/v1/responses" \
 echo "$response" | jq .
 echo "$response" | jq -e '.output[0].content[0].text | length > 0' >/dev/null
 
+tool_response="$(curl -fsS "http://127.0.0.1:${port}/v1/responses" \
+  -H 'content-type: application/json' \
+  -d '{
+    "model": "66ton99/gpt-oss-120b",
+    "prompt_cache_key": "smoke-tools",
+    "input": [
+      {
+        "role": "user",
+        "content": [{"type": "input_text", "text": "Use this command result."}]
+      },
+      {
+        "type": "function_call_output",
+        "call_id": "call_smoke",
+        "output": "command output"
+      }
+    ],
+    "max_output_tokens": 4,
+    "stream": false
+  }')"
+echo "$tool_response" | jq .
+echo "$tool_response" | jq -e '.output[0].content[0].text | length > 0' >/dev/null
+
 echo "smoke test passed"

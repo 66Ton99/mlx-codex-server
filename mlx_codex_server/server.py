@@ -74,9 +74,26 @@ def text_from_content(content: Any) -> str:
 def normalize_role(role: str | None) -> str:
     if role in {"developer", "system"}:
         return "system"
-    if role in {"assistant", "user", "tool"}:
+    if role in {"assistant", "user"}:
         return role
     return "user"
+
+
+def tool_transcript_text(item: dict[str, Any]) -> str:
+    item_type = str(item.get("type") or "tool")
+    call_id = item.get("call_id")
+    name = item.get("name")
+
+    if item_type in {"function_call_output", "custom_tool_call_output"}:
+        content = text_from_content(item.get("output") or item.get("content"))
+        label = "tool result"
+    else:
+        content = text_from_content(item.get("arguments") or item.get("input") or item.get("content"))
+        label = "tool call"
+
+    details = ", ".join(str(part) for part in (name, call_id) if part)
+    prefix = f"{label} ({details})" if details else label
+    return f"[{prefix}]\n{content}" if content else f"[{prefix}]"
 
 
 def response_input_to_messages(body: dict[str, Any]) -> list[dict[str, str]]:
@@ -101,10 +118,8 @@ def response_input_to_messages(body: dict[str, Any]) -> list[dict[str, str]]:
             continue
 
         item_type = item.get("type")
-        if item_type in {"function_call_output", "custom_tool_call_output"}:
-            content = text_from_content(item.get("output") or item.get("content"))
-            if content:
-                messages.append({"role": "tool", "content": content})
+        if item_type in {"function_call", "custom_tool_call", "function_call_output", "custom_tool_call_output"}:
+            messages.append({"role": "user", "content": tool_transcript_text(item)})
             continue
         if item_type in {"reasoning", "tool_search_call", "web_search_call", "image_generation_call"}:
             continue
