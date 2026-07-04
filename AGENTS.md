@@ -33,7 +33,7 @@ The shell sets these defaults:
 MLX_CODEX_MODEL_PATH=/Users/ton/.cache/lm-studio/models/66Ton99/gpt-oss-120b
 MLX_CODEX_MODEL_ID=66ton99/gpt-oss-120b
 MLX_CODEX_HOST=127.0.0.1
-MLX_CODEX_PORT=8000
+MLX_CODEX_PORT=1234
 ```
 
 ## Verified Launch
@@ -76,14 +76,14 @@ MLX_CODEX_PORT=18000 ./scripts/run-server
 Health check:
 
 ```sh
-curl -fsS http://127.0.0.1:8000/health | jq .
-curl -fsS http://127.0.0.1:8000/v1/models | jq .
+curl -fsS http://127.0.0.1:1234/health | jq .
+curl -fsS http://127.0.0.1:1234/v1/models | jq .
 ```
 
 Manual Responses API check:
 
 ```sh
-curl -fsS http://127.0.0.1:8000/v1/responses \
+curl -fsS http://127.0.0.1:1234/v1/responses \
   -H 'content-type: application/json' \
   -d '{
     "model": "66ton99/gpt-oss-120b",
@@ -102,7 +102,7 @@ talk to this server:
 ```toml
 [model_providers.mlx-codex]
 name = "mlx-codex"
-base_url = "http://127.0.0.1:8000/v1"
+base_url = "http://127.0.0.1:1234/v1"
 wire_api = "responses"
 ```
 
