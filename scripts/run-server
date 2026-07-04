@@ -1,0 +1,11 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+cd "$(dirname "$0")/.."
+
+exec python3 -m mlx_codex_server \
+  --model-path "${MLX_CODEX_MODEL_PATH:-/Users/ton/.cache/lm-studio/models/66Ton99/gpt-oss-120b}" \
+  --model-id "${MLX_CODEX_MODEL_ID:-66ton99/gpt-oss-120b}" \
+  --host "${MLX_CODEX_HOST:-127.0.0.1}" \
+  --port "${MLX_CODEX_PORT:-1234}" \
+  "$@"

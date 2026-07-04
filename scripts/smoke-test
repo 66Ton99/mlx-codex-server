@@ -1,0 +1,48 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+cd "$(dirname "$0")/.."
+
+mock=0
+if [[ "${1:-}" == "--mock" ]]; then
+  mock=1
+  shift
+fi
+
+port="${MLX_CODEX_PORT:-18000}"
+log="${TMPDIR:-/tmp}/mlx-codex-server-smoke.log"
+rm -f "$log"
+
+args=(--host 127.0.0.1 --port "$port" --model-id 66ton99/gpt-oss-120b)
+if [[ "$mock" == 1 ]]; then
+  args+=(--mock)
+else
+  args+=(--model-path "${MLX_CODEX_MODEL_PATH:-/Users/ton/.cache/lm-studio/models/66Ton99/gpt-oss-120b}")
+fi
+
+python3 -m mlx_codex_server "${args[@]}" >"$log" 2>&1 &
+pid=$!
+trap 'kill "$pid" 2>/dev/null || true' EXIT
+
+for _ in {1..80}; do
+  if curl -fsS "http://127.0.0.1:${port}/health" >/dev/null 2>&1; then
+    break
+  fi
+  sleep 0.25
+done
+
+curl -fsS "http://127.0.0.1:${port}/v1/models" | jq .
+
+response="$(curl -fsS "http://127.0.0.1:${port}/v1/responses" \
+  -H 'content-type: application/json' \
+  -d '{
+    "model": "66ton99/gpt-oss-120b",
+    "prompt_cache_key": "smoke",
+    "input": "Reply only: OK",
+    "max_output_tokens": 4,
+    "stream": false
+  }')"
+echo "$response" | jq .
+echo "$response" | jq -e '.output[0].content[0].text | length > 0' >/dev/null
+
+echo "smoke test passed"
