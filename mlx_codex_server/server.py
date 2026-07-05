@@ -9,7 +9,7 @@ import uuid
 from dataclasses import dataclass
 from http import HTTPStatus
 from http.server import BaseHTTPRequestHandler, HTTPServer
-from queue import Empty, Queue
+from threading import Event
 from threading import Lock
 from threading import Thread
 from typing import Any
@@ -717,43 +717,40 @@ class Handler(BaseHTTPRequestHandler):
         self.send_header("cache-control", "no-cache")
         self.end_headers()
 
-        self.wfile.write(sse({"type": "response.created", "response": {"id": rid, "status": "in_progress"}}))
-        self.wfile.flush()
+        write_lock = Lock()
+
+        def write_sse(data: bytes) -> None:
+            with write_lock:
+                self.wfile.write(data)
+                self.wfile.flush()
+
+        write_sse(sse({"type": "response.created", "response": {"id": rid, "status": "in_progress"}}))
         text_parts: list[str] = []
         last_result = GenerationResult("", 0, 0, 0)
-        queue: Queue[tuple[str, Any]] = Queue()
 
-        def generate() -> None:
-            try:
-                with self.app.generation_lock:
-                    for text, result in self.app.engine.stream(body):
-                        queue.put(("delta", (text, result)))
-                queue.put(("done", None))
-            except Exception as exc:
-                queue.put(("error", exc))
+        stop_heartbeat = Event()
 
-        worker = Thread(target=generate, name=f"mlx-stream-{rid}", daemon=True)
-        worker.start()
-
-        done = False
-        while not done:
-            try:
-                event, value = queue.get(timeout=self.app.stream_heartbeat_interval)
-            except Empty:
+        def heartbeat() -> None:
+            while not stop_heartbeat.wait(self.app.stream_heartbeat_interval):
                 LOG.debug("stream response id=%s heartbeat", rid)
-                self.wfile.write(b": keep-alive\n\n")
-                self.wfile.flush()
-                continue
+                try:
+                    write_sse(b": keep-alive\n\n")
+                except OSError:
+                    stop_heartbeat.set()
+                    return
 
-            if event == "delta":
-                text, result = value
-                text_parts.append(text)
-                last_result = result
-                LOG.debug("stream response id=%s delta=%r output_tokens=%d", rid, text, result.output_tokens)
-            elif event == "done":
-                done = True
-            elif event == "error":
-                raise value
+        heartbeat_worker = Thread(target=heartbeat, name=f"mlx-heartbeat-{rid}", daemon=True)
+        heartbeat_worker.start()
+
+        try:
+            with self.app.generation_lock:
+                for text, result in self.app.engine.stream(body):
+                    text_parts.append(text)
+                    last_result = result
+                    LOG.debug("stream response id=%s delta=%r output_tokens=%d", rid, text, result.output_tokens)
+        finally:
+            stop_heartbeat.set()
+            heartbeat_worker.join(timeout=1)
 
         payload = self.response_payload(rid, body, "".join(text_parts), last_result)
         output_item = payload["output"][0]
@@ -765,11 +762,10 @@ class Handler(BaseHTTPRequestHandler):
             last_result.output_tokens,
             preview("".join(text_parts)),
         )
-        self.wfile.write(sse({"type": "response.output_item.added", "output_index": 0, "item": output_item}))
-        self.wfile.write(sse({"type": "response.output_item.done", "output_index": 0, "item": output_item}))
-        self.wfile.write(sse({"type": "response.completed", "response": payload}))
-        self.wfile.write(sse("[DONE]"))
-        self.wfile.flush()
+        write_sse(sse({"type": "response.output_item.added", "output_index": 0, "item": output_item}))
+        write_sse(sse({"type": "response.output_item.done", "output_index": 0, "item": output_item}))
+        write_sse(sse({"type": "response.completed", "response": payload}))
+        write_sse(sse("[DONE]"))
 
 
 def parse_args() -> argparse.Namespace:
