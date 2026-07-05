@@ -15,7 +15,7 @@ rm -f "$log"
 
 args=(--host 127.0.0.1 --port "$port" --model-id 66ton99/gpt-oss-120b)
 if [[ "$mock" == 1 ]]; then
-  args+=(--mock --adaptation)
+  args+=(--mock --adaptation --stream-heartbeat-interval 0.05)
 else
   args+=(--model-path "${MLX_CODEX_MODEL_PATH:-/Users/ton/.cache/lm-studio/models/66Ton99/gpt-oss-120b}")
 fi
@@ -111,6 +111,19 @@ if [[ "$mock" == 1 ]]; then
   echo "$patch_stream" | grep -F '"type": "response.output_item.done"' >/dev/null
   echo "$patch_stream" | grep -F '"type": "custom_tool_call"' >/dev/null
   echo "$patch_stream" | grep -F '"name": "apply_patch"' >/dev/null
+
+  heartbeat_stream="$(curl -fsS "http://127.0.0.1:${port}/v1/responses" \
+    -H 'content-type: application/json' \
+    -d '{
+      "model": "66ton99/gpt-oss-120b",
+      "prompt_cache_key": "smoke-heartbeat-stream",
+      "input": "MOCK_SLOW_STREAM",
+      "max_output_tokens": 4,
+      "stream": true
+    }')"
+  echo "$heartbeat_stream"
+  echo "$heartbeat_stream" | grep -F ': keep-alive' >/dev/null
+  echo "$heartbeat_stream" | grep -F '"type": "response.completed"' >/dev/null
 
   final_response="$(curl -fsS "http://127.0.0.1:${port}/v1/responses" \
     -H 'content-type: application/json' \

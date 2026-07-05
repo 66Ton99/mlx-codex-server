@@ -9,7 +9,9 @@ import uuid
 from dataclasses import dataclass
 from http import HTTPStatus
 from http.server import BaseHTTPRequestHandler, HTTPServer
+from queue import Empty, Queue
 from threading import Lock
+from threading import Thread
 from typing import Any
 from urllib.parse import urlparse
 
@@ -399,6 +401,8 @@ class MockEngine:
         return GenerationResult("OK", prompt_tokens=16, cached_tokens=cached, output_tokens=1)
 
     def stream(self, body: dict[str, Any]):
+        if "MOCK_SLOW_STREAM" in json.dumps(body.get("input", ""), ensure_ascii=False):
+            time.sleep(0.15)
         result = self.generate(body)
         yield result.text, result
 
@@ -552,10 +556,11 @@ class MLXEngine:
 
 
 class App:
-    def __init__(self, engine: MockEngine | MLXEngine, model_id: str, *, adaptation: bool):
+    def __init__(self, engine: MockEngine | MLXEngine, model_id: str, *, adaptation: bool, stream_heartbeat_interval: float):
         self.engine = engine
         self.model_id = model_id
         self.adaptation = adaptation
+        self.stream_heartbeat_interval = stream_heartbeat_interval
         self.generation_lock = Lock()
 
 
@@ -716,12 +721,39 @@ class Handler(BaseHTTPRequestHandler):
         self.wfile.flush()
         text_parts: list[str] = []
         last_result = GenerationResult("", 0, 0, 0)
+        queue: Queue[tuple[str, Any]] = Queue()
 
-        with self.app.generation_lock:
-            for text, result in self.app.engine.stream(body):
+        def generate() -> None:
+            try:
+                with self.app.generation_lock:
+                    for text, result in self.app.engine.stream(body):
+                        queue.put(("delta", (text, result)))
+                queue.put(("done", None))
+            except Exception as exc:
+                queue.put(("error", exc))
+
+        worker = Thread(target=generate, name=f"mlx-stream-{rid}", daemon=True)
+        worker.start()
+
+        done = False
+        while not done:
+            try:
+                event, value = queue.get(timeout=self.app.stream_heartbeat_interval)
+            except Empty:
+                LOG.debug("stream response id=%s heartbeat", rid)
+                self.wfile.write(b": keep-alive\n\n")
+                self.wfile.flush()
+                continue
+
+            if event == "delta":
+                text, result = value
                 text_parts.append(text)
                 last_result = result
                 LOG.debug("stream response id=%s delta=%r output_tokens=%d", rid, text, result.output_tokens)
+            elif event == "done":
+                done = True
+            elif event == "error":
+                raise value
 
         payload = self.response_payload(rid, body, "".join(text_parts), last_result)
         output_item = payload["output"][0]
@@ -750,6 +782,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--max-kv-size", type=int)
     parser.add_argument("--prefill-step-size", type=int, default=512)
     parser.add_argument("--min-output-tokens", type=int, default=2048)
+    parser.add_argument("--stream-heartbeat-interval", type=float, default=15.0)
     parser.add_argument("-a", "--adaptation", action="store_true", help="Enable Codex/gpt-oss compatibility adaptations")
     parser.add_argument("--mock", action="store_true", help="Run without loading MLX model")
     parser.add_argument("--log-level", default="INFO")
@@ -779,6 +812,11 @@ def main() -> None:
         )
 
     httpd = HTTPServer((args.host, args.port), Handler)
-    httpd.app = App(engine, args.model_id, adaptation=args.adaptation)  # type: ignore[attr-defined]
+    httpd.app = App(
+        engine,
+        args.model_id,
+        adaptation=args.adaptation,
+        stream_heartbeat_interval=args.stream_heartbeat_interval,
+    )  # type: ignore[attr-defined]
     LOG.info("serving %s on http://%s:%s", args.model_id, args.host, args.port)
     httpd.serve_forever()
