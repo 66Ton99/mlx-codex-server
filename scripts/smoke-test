@@ -15,7 +15,7 @@ rm -f "$log"
 
 args=(--host 127.0.0.1 --port "$port" --model-id 66ton99/gpt-oss-120b)
 if [[ "$mock" == 1 ]]; then
-  args+=(--mock)
+  args+=(--mock --adaptation)
 else
   args+=(--model-path "${MLX_CODEX_MODEL_PATH:-/Users/ton/.cache/lm-studio/models/66Ton99/gpt-oss-120b}")
 fi
@@ -66,5 +66,112 @@ tool_response="$(curl -fsS "http://127.0.0.1:${port}/v1/responses" \
   }')"
 echo "$tool_response" | jq .
 echo "$tool_response" | jq -e '.output[0].content[0].text | length > 0' >/dev/null
+
+if [[ "$mock" == 1 ]]; then
+  patch_response="$(curl -fsS "http://127.0.0.1:${port}/v1/responses" \
+    -H 'content-type: application/json' \
+    -d '{
+      "model": "66ton99/gpt-oss-120b",
+      "prompt_cache_key": "smoke-patch",
+      "tools": [
+        {
+          "type": "custom",
+          "name": "apply_patch",
+          "description": "Apply a patch",
+          "format": {"type": "text"}
+        }
+      ],
+      "input": "MOCK_APPLY_PATCH_CALL",
+      "max_output_tokens": 32,
+      "stream": false
+    }')"
+  echo "$patch_response" | jq .
+  echo "$patch_response" | jq -e '.output[0].type == "custom_tool_call"' >/dev/null
+  echo "$patch_response" | jq -e '.output[0].name == "apply_patch"' >/dev/null
+  echo "$patch_response" | jq -e '.output[0].input | startswith("*** Begin Patch")' >/dev/null
+
+  patch_stream="$(curl -fsS "http://127.0.0.1:${port}/v1/responses" \
+    -H 'content-type: application/json' \
+    -d '{
+      "model": "66ton99/gpt-oss-120b",
+      "prompt_cache_key": "smoke-patch-stream",
+      "tools": [
+        {
+          "type": "custom",
+          "name": "apply_patch",
+          "description": "Apply a patch",
+          "format": {"type": "text"}
+        }
+      ],
+      "input": "MOCK_APPLY_PATCH_CALL",
+      "max_output_tokens": 32,
+      "stream": true
+    }')"
+  echo "$patch_stream"
+  echo "$patch_stream" | grep -F '"type": "response.output_item.done"' >/dev/null
+  echo "$patch_stream" | grep -F '"type": "custom_tool_call"' >/dev/null
+  echo "$patch_stream" | grep -F '"name": "apply_patch"' >/dev/null
+
+  final_response="$(curl -fsS "http://127.0.0.1:${port}/v1/responses" \
+    -H 'content-type: application/json' \
+    -d '{
+      "model": "66ton99/gpt-oss-120b",
+      "prompt_cache_key": "smoke-final-harmony",
+      "input": "MOCK_FINAL_HARMONY",
+      "max_output_tokens": 32,
+      "stream": false
+    }')"
+  echo "$final_response" | jq .
+  echo "$final_response" | jq -e '.output[0].content[0].text == "Clean final answer."' >/dev/null
+  echo "$final_response" | jq -e '.output[0].content[0].text | contains("<|channel|>") | not' >/dev/null
+
+  exec_response="$(curl -fsS "http://127.0.0.1:${port}/v1/responses" \
+    -H 'content-type: application/json' \
+    -d '{
+      "model": "66ton99/gpt-oss-120b",
+      "prompt_cache_key": "smoke-exec-bracket",
+      "input": "MOCK_EXEC_COMMAND_BRACKET",
+      "max_output_tokens": 64,
+      "stream": false
+    }')"
+  echo "$exec_response" | jq .
+  echo "$exec_response" | jq -e '.output[0].type == "function_call"' >/dev/null
+  echo "$exec_response" | jq -e '.output[0].name == "exec_command"' >/dev/null
+  echo "$exec_response" | jq -e '.output[0].arguments | fromjson | .cmd == "git add money.js && git commit -m \"Add money.js orchestrator for core money scripts\""' >/dev/null
+
+  python3 - <<'PY'
+from mlx_codex_server.server import response_input_to_messages
+from mlx_codex_server.server import response_text_from_generation
+from mlx_codex_server.server import tool_arguments_for
+from mlx_codex_server.server import tools_for_chat_template
+
+messages = response_input_to_messages({
+    "input": [
+        {
+            "role": "assistant",
+            "content": [{"type": "output_text", "text": "<|channel|>analysis<|message|>hidden<|end|><|start|>assistant<|channel|>final<|message|>visible<|end|>"}],
+        }
+    ]
+}, adaptation=True)
+assert messages == [{"role": "assistant", "content": "visible"}], messages
+
+messages = response_input_to_messages({"input": "log contains <|channel|>analysis<|message|>raw<|end|>"}, adaptation=True)
+assert "<|channel|>" not in messages[0]["content"], messages
+assert "< |channel|>" in messages[0]["content"], messages
+
+messages = response_input_to_messages({"input": "raw <|channel|> tag"}, adaptation=False)
+assert "<|channel|>" in messages[0]["content"], messages
+
+visible = response_text_from_generation("<|start|>assistant<|channel|>analysis<|message|>thinking only<|end|>")
+assert visible.startswith("[local model produced analysis-only output"), visible
+
+tools = tools_for_chat_template({"tools": [{"type": "custom", "name": "apply_patch", "description": "Apply patch"}]})
+assert tools[0]["function"]["name"] == "apply_patch", tools
+assert tools[0]["function"]["parameters"]["properties"]["input"]["type"] == "string", tools
+
+arguments = tool_arguments_for("exec_command", "function", '{"cmd":"git add money.js && git commit -m "Add money.js orchestrator for core money scripts""}')
+assert arguments == '{"cmd": "git add money.js && git commit -m \\"Add money.js orchestrator for core money scripts\\""}', arguments
+PY
+fi
 
 echo "smoke test passed"

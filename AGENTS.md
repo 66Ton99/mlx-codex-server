@@ -68,6 +68,7 @@ Useful variants:
 
 ```sh
 MLX_CODEX_PORT=18000 ./scripts/run-server
+./scripts/run-server --adaptation
 ./scripts/run-server --prompt-cache-size 4
 ./scripts/run-server --max-kv-size 4096
 ./scripts/run-server --log-level DEBUG

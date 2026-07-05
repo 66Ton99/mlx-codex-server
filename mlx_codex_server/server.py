@@ -15,6 +15,7 @@ from urllib.parse import urlparse
 
 
 LOG = logging.getLogger("mlx-codex-server")
+DEBUG_PREVIEW_CHARS = 4000
 
 
 def patch_transformers_for_mlx_lm() -> None:
@@ -50,6 +51,16 @@ def response_id() -> str:
 def sse(data: dict[str, Any] | str) -> bytes:
     payload = data if isinstance(data, str) else json.dumps(data, ensure_ascii=False)
     return f"data: {payload}\n\n".encode("utf-8")
+
+
+def preview(value: Any, *, limit: int = DEBUG_PREVIEW_CHARS) -> str:
+    if isinstance(value, str):
+        text = value
+    else:
+        text = json.dumps(value, ensure_ascii=False, default=str)
+    if len(text) <= limit:
+        return text
+    return f"{text[:limit]}... <truncated {len(text) - limit} chars>"
 
 
 def text_from_content(content: Any) -> str:
@@ -96,30 +107,49 @@ def tool_transcript_text(item: dict[str, Any]) -> str:
     return f"[{prefix}]\n{content}" if content else f"[{prefix}]"
 
 
-def response_input_to_messages(body: dict[str, Any]) -> list[dict[str, str]]:
+def append_message(messages: list[dict[str, str]], role: str, content: str, *, adaptation: bool) -> None:
+    if adaptation:
+        content = sanitize_message_content(role, content)
+    if content:
+        messages.append({"role": role, "content": content})
+
+
+def sanitize_message_content(role: str, content: str) -> str:
+    if role == "assistant":
+        content = response_text_from_generation(content)
+    return escape_harmony_tokens(content)
+
+
+def escape_harmony_tokens(content: str) -> str:
+    for token in ("<|channel|>", "<|message|>", "<|start|>", "<|end|>"):
+        content = content.replace(token, token.replace("<|", "< |"))
+    return content
+
+
+def response_input_to_messages(body: dict[str, Any], *, adaptation: bool = False) -> list[dict[str, str]]:
     messages: list[dict[str, str]] = []
 
     instructions = body.get("instructions")
     if isinstance(instructions, str) and instructions.strip():
-        messages.append({"role": "system", "content": instructions})
+        append_message(messages, "system", instructions, adaptation=adaptation)
 
     value = body.get("input", "")
     if isinstance(value, str):
-        messages.append({"role": "user", "content": value})
+        append_message(messages, "user", value, adaptation=adaptation)
         return messages
 
     if not isinstance(value, list):
-        messages.append({"role": "user", "content": str(value)})
+        append_message(messages, "user", str(value), adaptation=adaptation)
         return messages
 
     for item in value:
         if not isinstance(item, dict):
-            messages.append({"role": "user", "content": str(item)})
+            append_message(messages, "user", str(item), adaptation=adaptation)
             continue
 
         item_type = item.get("type")
         if item_type in {"function_call", "custom_tool_call", "function_call_output", "custom_tool_call_output"}:
-            messages.append({"role": "user", "content": tool_transcript_text(item)})
+            append_message(messages, "user", tool_transcript_text(item), adaptation=adaptation)
             continue
         if item_type in {"reasoning", "tool_search_call", "web_search_call", "image_generation_call"}:
             continue
@@ -127,8 +157,9 @@ def response_input_to_messages(body: dict[str, Any]) -> list[dict[str, str]]:
         role = normalize_role(item.get("role"))
         content = text_from_content(item.get("content") or item.get("text") or item.get("input"))
         if content:
-            messages.append({"role": role, "content": content})
+            append_message(messages, role, content, adaptation=adaptation)
 
+    LOG.debug("normalized %d response input item(s) into %d chat message(s)", len(value), len(messages))
     return messages
 
 
@@ -140,20 +171,236 @@ class GenerationResult:
     output_tokens: int
 
 
+def parse_tool_call_text(text: str) -> tuple[str, str] | None:
+    marker = "to="
+    message_marker = "<|message|>"
+    end_marker = "<|end|>"
+    search_from = 0
+    found: tuple[str, str] | None = None
+
+    while True:
+        marker_index = text.find(marker, search_from)
+        if marker_index == -1:
+            return found or parse_bracketed_tool_call_text(text)
+        message_index = text.find(message_marker, marker_index)
+        if message_index == -1:
+            return found or parse_bracketed_tool_call_text(text)
+
+        name_start = marker_index + len(marker)
+        name_end = name_start
+        while name_end < message_index and (text[name_end].isalnum() or text[name_end] in "._-"):
+            name_end += 1
+        name = text[name_start:name_end]
+        if not name:
+            search_from = marker_index + len(marker)
+            continue
+
+        content_start = message_index + len(message_marker)
+        content_end = text.find(end_marker, content_start)
+        if content_end == -1:
+            content_end = len(text)
+        found = (name, text[content_start:content_end])
+        search_from = content_end + len(end_marker)
+
+
+def parse_bracketed_tool_call_text(text: str) -> tuple[str, str] | None:
+    marker = "[tool call ("
+    marker_index = text.rfind(marker)
+    if marker_index == -1:
+        return None
+    name_start = marker_index + len(marker)
+    header_end = text.find(")]", name_start)
+    if header_end == -1:
+        return None
+    header = text[name_start:header_end]
+    name = header.split(",", 1)[0].strip()
+    if not name:
+        return None
+
+    arguments_start = text.find("{", header_end)
+    arguments_end = text.rfind("}")
+    if arguments_start == -1 or arguments_end == -1 or arguments_end < arguments_start:
+        return None
+    return name, text[arguments_start : arguments_end + 1]
+
+
+def parse_harmony_messages(text: str) -> list[tuple[str | None, str]]:
+    start_marker = "<|start|>assistant"
+    channel_marker = "<|channel|>"
+    message_marker = "<|message|>"
+    end_marker = "<|end|>"
+    messages: list[tuple[str | None, str]] = []
+    search_from = 0
+
+    while True:
+        start_index = text.find(start_marker, search_from)
+        if start_index == -1:
+            return messages
+        channel_index = text.find(channel_marker, start_index)
+        message_index = text.find(message_marker, start_index)
+        if message_index == -1:
+            return messages
+
+        channel = None
+        if channel_index != -1 and channel_index < message_index:
+            channel_start = channel_index + len(channel_marker)
+            channel_end = channel_start
+            while channel_end < message_index and (text[channel_end].isalnum() or text[channel_end] in "._-"):
+                channel_end += 1
+            channel = text[channel_start:channel_end] or None
+
+        content_start = message_index + len(message_marker)
+        content_end = text.find(end_marker, content_start)
+        if content_end == -1:
+            content_end = len(text)
+        messages.append((channel, text[content_start:content_end]))
+        search_from = content_end + len(end_marker)
+
+
+def response_text_from_generation(text: str) -> str:
+    messages = parse_harmony_messages(text)
+    if not messages:
+        return text
+    for preferred_channel in ("final", "commentary"):
+        for channel, content in reversed(messages):
+            if channel == preferred_channel:
+                return content.strip()
+    for channel, content in reversed(messages):
+        if channel != "analysis":
+            return content.strip()
+    return "[local model produced analysis-only output without a final answer or tool call]"
+
+
+def tools_for_chat_template(body: dict[str, Any]) -> list[dict[str, Any]]:
+    tools = body.get("tools")
+    if not isinstance(tools, list):
+        return []
+    normalized = []
+    for tool in tools:
+        if not isinstance(tool, dict):
+            continue
+        function = tool.get("function")
+        if isinstance(function, dict):
+            normalized.append({"type": "function", "function": function})
+            continue
+
+        name = tool.get("name")
+        if not isinstance(name, str) or not name:
+            continue
+        description = str(tool.get("description") or f"Call {name}.")
+        parameters = tool.get("parameters")
+        if not isinstance(parameters, dict):
+            parameters = {
+                "type": "object",
+                "properties": {
+                    "input": {
+                        "type": "string",
+                        "description": "Tool input.",
+                    }
+                },
+                "required": ["input"],
+            }
+        normalized.append(
+            {
+                "type": "function",
+                "function": {
+                    "name": name,
+                    "description": description,
+                    "parameters": parameters,
+                },
+            }
+        )
+    return normalized
+
+
+def tool_info_for(body: dict[str, Any], name: str) -> tuple[str, str | None]:
+    tools = body.get("tools")
+    if not isinstance(tools, list):
+        return inferred_tool_info(name)
+    short_name = name.rsplit(".", 1)[-1]
+    for tool in tools:
+        if isinstance(tool, dict) and tool.get("name") in {name, short_name}:
+            tool_type = tool.get("type")
+            tool_name = str(tool.get("name"))
+            return tool_name, str(tool_type) if tool_type is not None else None
+    return inferred_tool_info(name)
+
+
+def inferred_tool_info(name: str) -> tuple[str, str | None]:
+    short_name = name.rsplit(".", 1)[-1]
+    if short_name in {"exec_command", "write_stdin", "update_plan"}:
+        return short_name, "function"
+    return short_name, None
+
+
+def tool_arguments_for(tool_name: str, tool_type: str | None, raw: str) -> str:
+    if tool_type == "function":
+        try:
+            parsed = json.loads(raw)
+        except json.JSONDecodeError:
+            parsed = repair_jsonish_tool_arguments(raw)
+        return json.dumps(parsed, ensure_ascii=False)
+
+    try:
+        parsed = json.loads(raw)
+    except json.JSONDecodeError:
+        return raw
+    if isinstance(parsed, dict) and isinstance(parsed.get("input"), str):
+        return parsed["input"]
+    if tool_name in {"exec_command", "write_stdin", "update_plan"}:
+        return json.dumps(parsed, ensure_ascii=False)
+    if isinstance(parsed, dict) and isinstance(parsed.get("patch"), str):
+        return parsed["patch"]
+    return raw
+
+
+def repair_jsonish_tool_arguments(raw: str) -> dict[str, str]:
+    text = raw.strip()
+    for key in ("cmd", "command"):
+        prefix = f'{{"{key}":"'
+        suffix = '"}'
+        if text.startswith(prefix) and text.endswith(suffix):
+            return {key: text[len(prefix) : -len(suffix)]}
+    return {"input": raw}
+
+
 class MockEngine:
-    def __init__(self, model_id: str):
+    def __init__(self, model_id: str, *, adaptation: bool):
         self.model_id = model_id
+        self.adaptation = adaptation
         self.cache_hits: dict[str, int] = {}
 
     def generate(self, body: dict[str, Any]) -> GenerationResult:
         key = body.get("prompt_cache_key") or "default"
         cached = self.cache_hits.get(key, 0)
         self.cache_hits[key] = 16
+        if self.adaptation and "MOCK_APPLY_PATCH_CALL" in json.dumps(body.get("input", ""), ensure_ascii=False):
+            text = (
+                '<|start|>assistant<|channel|>commentary to=apply_patch code<|message|>'
+                '{"patch":"*** Begin Patch\\n*** Add File: mock.txt\\n+OK\\n*** End Patch\\n"}'
+                '<|end|>'
+            )
+            return GenerationResult(text, prompt_tokens=16, cached_tokens=cached, output_tokens=16)
+        if self.adaptation and "MOCK_FINAL_HARMONY" in json.dumps(body.get("input", ""), ensure_ascii=False):
+            text = (
+                "<|channel|>analysis<|message|>Hidden reasoning.<|end|>"
+                "<|start|>assistant<|channel|>final<|message|>Clean final answer.<|end|>"
+            )
+            return GenerationResult(text, prompt_tokens=16, cached_tokens=cached, output_tokens=16)
+        if self.adaptation and "MOCK_EXEC_COMMAND_BRACKET" in json.dumps(body.get("input", ""), ensure_ascii=False):
+            text = (
+                "<|channel|>analysis<|message|>Need to commit.<|end|>"
+                "<|start|>assistant<|channel|>commentary<|message|>"
+                "[tool call (exec_command, commit_money_js)]\n"
+                '{"cmd":"git add money.js && git commit -m \\"Add money.js orchestrator for core money scripts\\""}'
+                "<|end|>"
+            )
+            return GenerationResult(text, prompt_tokens=16, cached_tokens=cached, output_tokens=32)
         return GenerationResult("OK", prompt_tokens=16, cached_tokens=cached, output_tokens=1)
 
     def stream(self, body: dict[str, Any]):
         result = self.generate(body)
-        yield "OK", result
+        yield result.text, result
 
 
 class MLXEngine:
@@ -165,6 +412,8 @@ class MLXEngine:
         prompt_cache_size: int,
         max_kv_size: int | None,
         prefill_step_size: int,
+        min_output_tokens: int,
+        adaptation: bool,
     ):
         patch_transformers_for_mlx_lm()
         from mlx_lm import load
@@ -177,6 +426,8 @@ class MLXEngine:
         self.prompt_cache_size = prompt_cache_size
         self.max_kv_size = max_kv_size
         self.prefill_step_size = prefill_step_size
+        self.min_output_tokens = min_output_tokens
+        self.adaptation = adaptation
         self.caches: dict[str, Any] = {}
         LOG.info("model loaded")
 
@@ -188,14 +439,31 @@ class MLXEngine:
         return cache
 
     def render_prompt(self, body: dict[str, Any]) -> str:
-        messages = response_input_to_messages(body)
+        messages = response_input_to_messages(body, adaptation=self.adaptation)
+        tools = tools_for_chat_template(body) if self.adaptation else []
+        LOG.debug("chat messages: %s", preview(messages))
         if hasattr(self.tokenizer, "apply_chat_template"):
-            return self.tokenizer.apply_chat_template(
-                messages,
-                tokenize=False,
-                add_generation_prompt=True,
-            )
-        return "\n".join(f"{m['role']}: {m['content']}" for m in messages) + "\nassistant:"
+            template_kwargs = {
+                "tokenize": False,
+                "add_generation_prompt": True,
+            }
+            if tools:
+                template_kwargs["tools"] = tools
+            try:
+                prompt = self.tokenizer.apply_chat_template(messages, **template_kwargs)
+            except Exception:
+                if not tools:
+                    raise
+                LOG.exception("apply_chat_template failed with tools; retrying without tools")
+                prompt = self.tokenizer.apply_chat_template(
+                    messages,
+                    tokenize=False,
+                    add_generation_prompt=True,
+                )
+        else:
+            prompt = "\n".join(f"{m['role']}: {m['content']}" for m in messages) + "\nassistant:"
+        LOG.debug("rendered prompt chars=%d preview=%s", len(prompt), preview(prompt))
+        return prompt
 
     def encode(self, prompt: str) -> list[int]:
         encoded = self.tokenizer.encode(prompt)
@@ -219,6 +487,14 @@ class MLXEngine:
         cache_store = self.cache_for(key)
         cache, rest = cache_store.fetch_nearest_cache(self.model_id, tokens)
         cached_tokens = len(tokens) - len(rest)
+        LOG.debug(
+            "cache lookup key=%r hit=%s prompt_tokens=%d cached_tokens=%d suffix_tokens=%d",
+            key,
+            cache is not None,
+            len(tokens),
+            cached_tokens,
+            len(rest),
+        )
         if cache is not None and not rest:
             LOG.info("full prompt cache hit cannot be reused directly by stream_generate; falling back to prefill")
             cache = None
@@ -227,16 +503,19 @@ class MLXEngine:
         if cache is None:
             cache = make_prompt_cache(self.model, max_kv_size=self.max_kv_size)
 
-        max_tokens = int(body.get("max_output_tokens") or body.get("max_tokens") or 512)
+        requested_max_tokens = int(body.get("max_output_tokens") or body.get("max_tokens") or 512)
+        max_tokens = max(requested_max_tokens, self.min_output_tokens) if self.adaptation else requested_max_tokens
         generated: list[str] = []
         generated_token_ids: list[int] = []
 
         LOG.info(
-            "request prompt_cache_key=%r prompt_tokens=%d cached_tokens=%d suffix_tokens=%d",
+            "request prompt_cache_key=%r prompt_tokens=%d cached_tokens=%d suffix_tokens=%d max_tokens=%d requested_max_tokens=%d",
             key,
             len(tokens),
             cached_tokens,
             len(rest),
+            max_tokens,
+            requested_max_tokens,
         )
 
         for chunk in stream_generate(
@@ -251,16 +530,19 @@ class MLXEngine:
             token = getattr(chunk, "token", None)
             if isinstance(token, int):
                 generated_token_ids.append(token)
+                LOG.debug("generated token id=%d text=%r", token, text)
             if text:
                 generated.append(text)
                 result = GenerationResult("", len(tokens), cached_tokens, len(generated_token_ids))
                 yield text, result
             finish_reason = getattr(chunk, "finish_reason", None)
             if finish_reason:
+                LOG.debug("generation finish_reason=%r", finish_reason)
                 break
 
         cache_key = tokens + generated_token_ids
         cache_store.insert_cache(self.model_id, copy.deepcopy(cache_key), cache)
+        LOG.debug("stored prompt cache key=%r total_cached_sequence_tokens=%d", key, len(cache_key))
         self._last_result = GenerationResult(
             "".join(generated),
             len(tokens),
@@ -270,9 +552,10 @@ class MLXEngine:
 
 
 class App:
-    def __init__(self, engine: MockEngine | MLXEngine, model_id: str):
+    def __init__(self, engine: MockEngine | MLXEngine, model_id: str, *, adaptation: bool):
         self.engine = engine
         self.model_id = model_id
+        self.adaptation = adaptation
         self.generation_lock = Lock()
 
 
@@ -331,6 +614,15 @@ class Handler(BaseHTTPRequestHandler):
 
         try:
             body = self.read_json()
+            LOG.debug(
+                "request path=%s stream=%s model=%r prompt_cache_key=%r max_output_tokens=%r body=%s",
+                path,
+                body.get("stream"),
+                body.get("model"),
+                body.get("prompt_cache_key"),
+                body.get("max_output_tokens") or body.get("max_tokens"),
+                preview(body),
+            )
             if body.get("stream"):
                 self.handle_stream_response(body)
             else:
@@ -342,22 +634,52 @@ class Handler(BaseHTTPRequestHandler):
                 HTTPStatus.INTERNAL_SERVER_ERROR,
             )
 
-    def response_payload(self, rid: str, text: str, result: GenerationResult) -> dict[str, Any]:
+    def response_output_item(self, rid: str, body: dict[str, Any], text: str) -> dict[str, Any]:
+        tool_call = parse_tool_call_text(text) if self.app.adaptation else None
+        if tool_call:
+            name, raw_arguments = tool_call
+            call_id = f"call_{uuid.uuid4().hex}"
+            tool_name, tool_type = tool_info_for(body, name)
+            arguments = tool_arguments_for(tool_name, tool_type, raw_arguments)
+            if tool_type == "function":
+                return {
+                    "id": f"fc_{uuid.uuid4().hex}",
+                    "type": "function_call",
+                    "status": "completed",
+                    "call_id": call_id,
+                    "name": tool_name,
+                    "arguments": arguments,
+                }
+            return {
+                "id": f"ctc_{uuid.uuid4().hex}",
+                "type": "custom_tool_call",
+                "status": "completed",
+                "call_id": call_id,
+                "name": tool_name,
+                "input": arguments,
+            }
+        return {
+            "id": f"msg_{uuid.uuid4().hex}",
+            "type": "message",
+            "status": "completed",
+            "role": "assistant",
+            "content": [
+                {
+                    "type": "output_text",
+                    "text": response_text_from_generation(text) if self.app.adaptation else text,
+                    "annotations": [],
+                }
+            ],
+        }
+
+    def response_payload(self, rid: str, body: dict[str, Any], text: str, result: GenerationResult) -> dict[str, Any]:
         return {
             "id": rid,
             "object": "response",
             "created_at": now(),
             "status": "completed",
             "model": self.app.model_id,
-            "output": [
-                {
-                    "id": f"msg_{uuid.uuid4().hex}",
-                    "type": "message",
-                    "status": "completed",
-                    "role": "assistant",
-                    "content": [{"type": "output_text", "text": text, "annotations": []}],
-                }
-            ],
+            "output": [self.response_output_item(rid, body, text)],
             "usage": {
                 "input_tokens": result.prompt_tokens,
                 "input_tokens_details": {"cached_tokens": result.cached_tokens},
@@ -369,12 +691,22 @@ class Handler(BaseHTTPRequestHandler):
 
     def handle_response(self, body: dict[str, Any]) -> None:
         rid = response_id()
+        LOG.debug("starting non-stream response id=%s", rid)
         with self.app.generation_lock:
             result = self.app.engine.generate(body)
-        self.write_json(self.response_payload(rid, result.text, result))
+        LOG.debug(
+            "completed non-stream response id=%s input_tokens=%d cached_tokens=%d output_tokens=%d text=%s",
+            rid,
+            result.prompt_tokens,
+            result.cached_tokens,
+            result.output_tokens,
+            preview(result.text),
+        )
+        self.write_json(self.response_payload(rid, body, result.text, result))
 
     def handle_stream_response(self, body: dict[str, Any]) -> None:
         rid = response_id()
+        LOG.debug("starting stream response id=%s", rid)
         self.send_response(200)
         self.send_header("content-type", "text/event-stream")
         self.send_header("cache-control", "no-cache")
@@ -384,26 +716,25 @@ class Handler(BaseHTTPRequestHandler):
         self.wfile.flush()
         text_parts: list[str] = []
         last_result = GenerationResult("", 0, 0, 0)
-        output_index = 0
 
         with self.app.generation_lock:
             for text, result in self.app.engine.stream(body):
                 text_parts.append(text)
                 last_result = result
-                self.wfile.write(
-                    sse(
-                        {
-                            "type": "response.output_text.delta",
-                            "item_id": f"msg_{rid}",
-                            "output_index": output_index,
-                            "content_index": 0,
-                            "delta": text,
-                        }
-                    )
-                )
-                self.wfile.flush()
+                LOG.debug("stream response id=%s delta=%r output_tokens=%d", rid, text, result.output_tokens)
 
-        payload = self.response_payload(rid, "".join(text_parts), last_result)
+        payload = self.response_payload(rid, body, "".join(text_parts), last_result)
+        output_item = payload["output"][0]
+        LOG.debug(
+            "completed stream response id=%s input_tokens=%d cached_tokens=%d output_tokens=%d text=%s",
+            rid,
+            last_result.prompt_tokens,
+            last_result.cached_tokens,
+            last_result.output_tokens,
+            preview("".join(text_parts)),
+        )
+        self.wfile.write(sse({"type": "response.output_item.added", "output_index": 0, "item": output_item}))
+        self.wfile.write(sse({"type": "response.output_item.done", "output_index": 0, "item": output_item}))
         self.wfile.write(sse({"type": "response.completed", "response": payload}))
         self.wfile.write(sse("[DONE]"))
         self.wfile.flush()
@@ -418,17 +749,24 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--prompt-cache-size", type=int, default=8)
     parser.add_argument("--max-kv-size", type=int)
     parser.add_argument("--prefill-step-size", type=int, default=512)
+    parser.add_argument("--min-output-tokens", type=int, default=2048)
+    parser.add_argument("-a", "--adaptation", action="store_true", help="Enable Codex/gpt-oss compatibility adaptations")
     parser.add_argument("--mock", action="store_true", help="Run without loading MLX model")
     parser.add_argument("--log-level", default="INFO")
+    parser.add_argument("-d", "--debug", action="store_true", help="Enable verbose debug logging")
     return parser.parse_args()
 
 
 def main() -> None:
     args = parse_args()
-    logging.basicConfig(level=getattr(logging, args.log_level.upper()), format="%(asctime)s %(levelname)s %(message)s")
+    log_level = "DEBUG" if args.debug else args.log_level.upper()
+    logging.basicConfig(level=getattr(logging, log_level), format="%(asctime)s %(levelname)s %(message)s")
+    if args.debug:
+        LOG.debug("debug logging enabled")
+    LOG.info("adaptation mode %s", "enabled" if args.adaptation else "disabled")
 
     if args.mock:
-        engine: MockEngine | MLXEngine = MockEngine(args.model_id)
+        engine: MockEngine | MLXEngine = MockEngine(args.model_id, adaptation=args.adaptation)
     else:
         engine = MLXEngine(
             args.model_path,
@@ -436,9 +774,11 @@ def main() -> None:
             prompt_cache_size=args.prompt_cache_size,
             max_kv_size=args.max_kv_size,
             prefill_step_size=args.prefill_step_size,
+            min_output_tokens=args.min_output_tokens,
+            adaptation=args.adaptation,
         )
 
     httpd = HTTPServer((args.host, args.port), Handler)
-    httpd.app = App(engine, args.model_id)  # type: ignore[attr-defined]
+    httpd.app = App(engine, args.model_id, adaptation=args.adaptation)  # type: ignore[attr-defined]
     LOG.info("serving %s on http://%s:%s", args.model_id, args.host, args.port)
     httpd.serve_forever()
