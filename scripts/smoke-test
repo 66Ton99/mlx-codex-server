@@ -19,7 +19,11 @@ args=(--config "$config" --host 127.0.0.1 --port "$port" --model-id 66ton99/gpt-
 if [[ "$mock" == 1 ]]; then
   args+=(--mock --adaptation --stream-heartbeat-interval 0.05)
 else
-  args+=(--model-path "${MLX_CODEX_MODEL_PATH:-/Users/ton/.cache/lm-studio/models/66Ton99/gpt-oss-120b}")
+  if [[ -z "${MLX_CODEX_MODEL_PATH:-}" ]]; then
+    echo "MLX_CODEX_MODEL_PATH is required for non-mock smoke tests" >&2
+    exit 1
+  fi
+  args+=(--model-path "$MLX_CODEX_MODEL_PATH")
 fi
 
 python3 -m mlx_codex_server "${args[@]}" >"$log" 2>&1 &

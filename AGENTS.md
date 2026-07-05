@@ -23,14 +23,13 @@ git. `nix-shell` creates and syncs it automatically.
 ## Setup
 
 ```sh
-cd /Volumes/SRC/mlx-codex-server
 nix-shell
 ```
 
 The shell sets these defaults:
 
 ```sh
-MLX_CODEX_MODEL_PATH=/Users/ton/.cache/lm-studio/models/66Ton99/gpt-oss-120b
+MLX_CODEX_MODEL_PATH=/path/to/local/mlx/model
 MLX_CODEX_MODEL_ID=66ton99/gpt-oss-120b
 MLX_CODEX_HOST=127.0.0.1
 MLX_CODEX_PORT=1234
@@ -47,9 +46,9 @@ The lightweight launch path has been verified:
 That command starts the server, calls `/v1/models`, calls `/v1/responses` with a
 `prompt_cache_key`, checks that output text is returned, then stops the server.
 
-The real MLX model path has also been verified on this machine. The server
-loaded `/Users/ton/.cache/lm-studio/models/66Ton99/gpt-oss-120b`, returned
-`/health`, and completed a minimal `/v1/responses` generation request on port
+The real MLX model path has also been verified on this machine. With
+`MLX_CODEX_MODEL_PATH` pointing at a local MLX model, the server returned
+`/health` and completed a minimal `/v1/responses` generation request on port
 `18001`.
 
 ## Real Model Launch
@@ -59,7 +58,6 @@ not keep LM Studio and this server serving `gpt-oss-120b` at the same time unles
 you deliberately want two copies of the model resident in memory.
 
 ```sh
-cd /Volumes/SRC/mlx-codex-server
 nix-shell
 ./scripts/run-server
 ```
@@ -97,7 +95,7 @@ curl -fsS http://127.0.0.1:1234/v1/responses \
 
 ## Codex Config
 
-Add a separate provider in `/Users/ton/.codex/config.toml` when you want Codex to
+Add a separate provider in your Codex `config.toml` when you want Codex to
 talk to this server:
 
 ```toml
@@ -112,7 +110,7 @@ Then use a profile like:
 ```toml
 model = "66ton99/gpt-oss-120b"
 model_provider = "mlx-codex"
-model_catalog_json = "/Users/ton/.codex/model-catalogs/with-lmstudio-gpt-oss-120b.json"
+model_catalog_json = "/path/to/model-catalog.json"
 model_reasoning_effort = "high"
 include_permissions_instructions = false
 include_apps_instructions = false
@@ -185,7 +183,6 @@ MLX_CODEX_PORT=18000 ./scripts/run-server
 If Python modules are missing, re-enter the shell:
 
 ```sh
-cd /Volumes/SRC/mlx-codex-server
 nix-shell
 ```
 

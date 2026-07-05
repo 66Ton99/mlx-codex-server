@@ -12,7 +12,6 @@ pkgs.mkShell {
     export PYTHONUNBUFFERED=1
     export UV_PROJECT_ENVIRONMENT="$PWD/.venv"
     export UV_LINK_MODE="''${UV_LINK_MODE:-copy}"
-    export MLX_CODEX_MODEL_PATH="''${MLX_CODEX_MODEL_PATH:-/Users/ton/.cache/lm-studio/models/66Ton99/gpt-oss-120b}"
     export MLX_CODEX_MODEL_ID="''${MLX_CODEX_MODEL_ID:-66ton99/gpt-oss-120b}"
     export MLX_CODEX_HOST="''${MLX_CODEX_HOST:-127.0.0.1}"
     export MLX_CODEX_PORT="''${MLX_CODEX_PORT:-1234}"

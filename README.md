@@ -9,6 +9,7 @@ helpers.
 
 ```sh
 nix-shell
+export MLX_CODEX_MODEL_PATH=/path/to/local/mlx/model
 ./scripts/run-server --adaptation
 ```
 

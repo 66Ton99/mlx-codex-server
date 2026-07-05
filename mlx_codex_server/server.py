@@ -928,7 +928,7 @@ def default_config() -> dict[str, Any]:
     return {
         "host": os.environ.get("MLX_CODEX_HOST", "127.0.0.1"),
         "port": int(os.environ.get("MLX_CODEX_PORT", "1234")),
-        "model_path": os.environ.get("MLX_CODEX_MODEL_PATH", "/Users/ton/.cache/lm-studio/models/66Ton99/gpt-oss-120b"),
+        "model_path": os.environ.get("MLX_CODEX_MODEL_PATH"),
         "model_id": os.environ.get("MLX_CODEX_MODEL_ID", "66ton99/gpt-oss-120b"),
         "prompt_cache_size": 8,
         "max_kv_size": None,
@@ -1020,6 +1020,8 @@ def main() -> None:
     if args.mock:
         engine: MockEngine | MLXEngine = MockEngine(args.model_id, adaptation=args.adaptation)
     else:
+        if not args.model_path:
+            raise SystemExit("Set MLX_CODEX_MODEL_PATH or pass --model-path before launching the real MLX model")
         engine = MLXEngine(
             args.model_path,
             args.model_id,
