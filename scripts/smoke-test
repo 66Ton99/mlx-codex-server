@@ -124,6 +124,9 @@ if [[ "$mock" == 1 ]]; then
   echo "$heartbeat_stream"
   echo "$heartbeat_stream" | grep -F ': keep-alive' >/dev/null
   echo "$heartbeat_stream" | grep -F 'progress=' >/dev/null
+  echo "$heartbeat_stream" | grep -F '"type": "response.in_progress"' >/dev/null
+  echo "$heartbeat_stream" | grep -F 'prompt_tokens=16' >/dev/null
+  echo "$heartbeat_stream" | grep -F 'suffix_tokens=16' >/dev/null
   echo "$heartbeat_stream" | grep -F '"type": "response.completed"' >/dev/null
 
   final_response="$(curl -fsS "http://127.0.0.1:${port}/v1/responses" \
@@ -156,6 +159,7 @@ if [[ "$mock" == 1 ]]; then
   python3 - <<'PY'
 from mlx_codex_server.server import response_input_to_messages
 from mlx_codex_server.server import response_text_from_generation
+from mlx_codex_server.server import is_analysis_only_generation
 from mlx_codex_server.server import tool_arguments_for
 from mlx_codex_server.server import tools_for_chat_template
 
@@ -178,6 +182,13 @@ assert "<|channel|>" in messages[0]["content"], messages
 
 visible = response_text_from_generation("<|start|>assistant<|channel|>analysis<|message|>thinking only<|end|>")
 assert visible.startswith("[local model produced analysis-only output"), visible
+visible = response_text_from_generation("<|channel|>analysis<|message|>thinking only")
+assert visible.startswith("[local model produced analysis-only output"), visible
+visible = response_text_from_generation("<|channel|>final<|message|>done")
+assert visible == "done", visible
+assert is_analysis_only_generation("<|channel|>analysis<|message|>thinking only"), "analysis-only was not detected"
+assert not is_analysis_only_generation("<|channel|>commentary<|message|>I will check files."), "commentary was treated as analysis-only"
+assert not is_analysis_only_generation('[tool call (exec_command, ls)]\n{"cmd":"ls"}'), "tool call was treated as analysis-only"
 
 tools = tools_for_chat_template({"tools": [{"type": "custom", "name": "apply_patch", "description": "Apply patch"}]})
 assert tools[0]["function"]["name"] == "apply_patch", tools

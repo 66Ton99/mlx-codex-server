@@ -12,12 +12,17 @@ from http.server import BaseHTTPRequestHandler, HTTPServer
 from threading import Event
 from threading import Lock
 from threading import Thread
-from typing import Any
+from typing import Any, Callable
 from urllib.parse import urlparse
 
 
 LOG = logging.getLogger("mlx-codex-server")
 DEBUG_PREVIEW_CHARS = 4000
+CODEX_ADAPTATION_REMINDER = (
+    "Codex adapter reminder: do not stop after analysis. If workspace inspection or edits are needed, "
+    "emit a commentary tool call. If no tool call is needed, emit a final answer. Do not expose analysis "
+    "as the visible answer."
+)
 
 
 def patch_transformers_for_mlx_lm() -> None:
@@ -174,6 +179,10 @@ class GenerationResult:
     max_tokens: int = 0
 
 
+class ClientDisconnected(Exception):
+    pass
+
+
 def parse_tool_call_text(text: str) -> tuple[str, str] | None:
     marker = "to="
     message_marker = "<|message|>"
@@ -237,10 +246,19 @@ def parse_harmony_messages(text: str) -> list[tuple[str | None, str]]:
 
     while True:
         start_index = text.find(start_marker, search_from)
-        if start_index == -1:
+        bare_channel_index = text.find(channel_marker, search_from)
+        if start_index == -1 and bare_channel_index == -1:
             return messages
-        channel_index = text.find(channel_marker, start_index)
-        message_index = text.find(message_marker, start_index)
+
+        if start_index == -1:
+            message_start = bare_channel_index
+        elif bare_channel_index == -1:
+            message_start = start_index
+        else:
+            message_start = min(start_index, bare_channel_index)
+
+        channel_index = text.find(channel_marker, message_start)
+        message_index = text.find(message_marker, message_start)
         if message_index == -1:
             return messages
 
@@ -257,7 +275,7 @@ def parse_harmony_messages(text: str) -> list[tuple[str | None, str]]:
         if content_end == -1:
             content_end = len(text)
         messages.append((channel, text[content_start:content_end]))
-        search_from = content_end + len(end_marker)
+        search_from = content_end + len(end_marker) if content_end < len(text) else len(text)
 
 
 def response_text_from_generation(text: str) -> str:
@@ -272,6 +290,17 @@ def response_text_from_generation(text: str) -> str:
         if channel != "analysis":
             return content.strip()
     return "[local model produced analysis-only output without a final answer or tool call]"
+
+
+def is_analysis_only_generation(text: str) -> bool:
+    if parse_tool_call_text(text) is not None:
+        return False
+    if "<|channel|>final" in text or "<|channel|>commentary" in text:
+        return False
+    messages = parse_harmony_messages(text)
+    if messages:
+        return all(channel == "analysis" for channel, _ in messages)
+    return "<|channel|>analysis" in text
 
 
 def tools_for_chat_template(body: dict[str, Any]) -> list[dict[str, Any]]:
@@ -401,10 +430,12 @@ class MockEngine:
             return GenerationResult(text, prompt_tokens=16, cached_tokens=cached, output_tokens=32, max_tokens=64)
         return GenerationResult("OK", prompt_tokens=16, cached_tokens=cached, output_tokens=1, max_tokens=4)
 
-    def stream(self, body: dict[str, Any]):
+    def stream(self, body: dict[str, Any], progress_callback: Callable[[GenerationResult, str], None] | None = None):
+        result = self.generate(body)
+        if progress_callback is not None:
+            progress_callback(GenerationResult("", result.prompt_tokens, result.cached_tokens, 0, result.max_tokens), "prefill")
         if "MOCK_SLOW_STREAM" in json.dumps(body.get("input", ""), ensure_ascii=False):
             time.sleep(0.15)
-        result = self.generate(body)
         yield result.text, result
 
 
@@ -418,6 +449,7 @@ class MLXEngine:
         max_kv_size: int | None,
         prefill_step_size: int,
         min_output_tokens: int,
+        analysis_only_token_limit: int,
         adaptation: bool,
     ):
         patch_transformers_for_mlx_lm()
@@ -433,6 +465,7 @@ class MLXEngine:
         self.max_kv_size = max_kv_size
         self.prefill_step_size = prefill_step_size
         self.min_output_tokens = min_output_tokens
+        self.analysis_only_token_limit = analysis_only_token_limit
         self.adaptation = adaptation
         self.caches: dict[str, Any] = {}
         LOG.info("model loaded")
@@ -446,6 +479,8 @@ class MLXEngine:
 
     def render_prompt(self, body: dict[str, Any]) -> str:
         messages = response_input_to_messages(body, adaptation=self.adaptation)
+        if self.adaptation:
+            messages.append({"role": "system", "content": CODEX_ADAPTATION_REMINDER})
         tools = tools_for_chat_template(body) if self.adaptation else []
         LOG.debug("chat messages: %s", preview(messages))
         if hasattr(self.tokenizer, "apply_chat_template"):
@@ -482,7 +517,7 @@ class MLXEngine:
         result = getattr(self, "_last_result")
         return GenerationResult(text, result.prompt_tokens, result.cached_tokens, result.output_tokens, result.max_tokens)
 
-    def stream(self, body: dict[str, Any]):
+    def stream(self, body: dict[str, Any], progress_callback: Callable[[GenerationResult, str], None] | None = None):
         patch_transformers_for_mlx_lm()
         from mlx_lm import stream_generate
         from mlx_lm.models.cache import can_trim_prompt_cache
@@ -525,6 +560,8 @@ class MLXEngine:
             max_tokens,
             requested_max_tokens,
         )
+        if progress_callback is not None:
+            progress_callback(GenerationResult("", len(tokens), cached_tokens, 0, max_tokens), "prefill")
 
         for chunk in stream_generate(
             self.model,
@@ -543,6 +580,17 @@ class MLXEngine:
                 generated.append(text)
                 result = GenerationResult("", len(tokens), cached_tokens, len(generated_token_ids), max_tokens)
                 yield text, result
+            if (
+                self.adaptation
+                and self.analysis_only_token_limit > 0
+                and len(generated_token_ids) >= self.analysis_only_token_limit
+                and is_analysis_only_generation("".join(generated))
+            ):
+                LOG.info(
+                    "stopping analysis-only generation after %d token(s); no final answer or tool call detected",
+                    len(generated_token_ids),
+                )
+                break
             finish_reason = getattr(chunk, "finish_reason", None)
             if finish_reason:
                 LOG.debug("generation finish_reason=%r", finish_reason)
@@ -570,11 +618,20 @@ class MLXEngine:
 
 
 class App:
-    def __init__(self, engine: MockEngine | MLXEngine, model_id: str, *, adaptation: bool, stream_heartbeat_interval: float):
+    def __init__(
+        self,
+        engine: MockEngine | MLXEngine,
+        model_id: str,
+        *,
+        adaptation: bool,
+        stream_heartbeat_interval: float,
+        prefill_progress_tokens_per_second: float,
+    ):
         self.engine = engine
         self.model_id = model_id
         self.adaptation = adaptation
         self.stream_heartbeat_interval = stream_heartbeat_interval
+        self.prefill_progress_tokens_per_second = prefill_progress_tokens_per_second
         self.generation_lock = Lock()
 
 
@@ -646,6 +703,8 @@ class Handler(BaseHTTPRequestHandler):
                 self.handle_stream_response(body)
             else:
                 self.handle_response(body)
+        except ClientDisconnected:
+            LOG.info("client disconnected while streaming response")
         except Exception as exc:
             LOG.exception("request failed")
             self.write_json(
@@ -735,8 +794,11 @@ class Handler(BaseHTTPRequestHandler):
 
         def write_sse(data: bytes) -> None:
             with write_lock:
-                self.wfile.write(data)
-                self.wfile.flush()
+                try:
+                    self.wfile.write(data)
+                    self.wfile.flush()
+                except OSError as exc:
+                    raise ClientDisconnected() from exc
 
         write_sse(sse({"type": "response.created", "response": {"id": rid, "status": "in_progress"}}))
         text_parts: list[str] = []
@@ -748,11 +810,21 @@ class Handler(BaseHTTPRequestHandler):
             "phase": "prefill",
             "prompt_tokens": 0,
             "cached_tokens": 0,
+            "suffix_tokens": 0,
             "output_tokens": 0,
             "max_tokens": expected_max_tokens,
         }
         progress_lock = Lock()
         started_at = time.monotonic()
+
+        def update_progress(result: GenerationResult, phase: str) -> None:
+            with progress_lock:
+                progress["phase"] = phase
+                progress["prompt_tokens"] = result.prompt_tokens
+                progress["cached_tokens"] = result.cached_tokens
+                progress["suffix_tokens"] = max(result.prompt_tokens - result.cached_tokens, 0)
+                progress["output_tokens"] = result.output_tokens
+                progress["max_tokens"] = result.max_tokens
 
         stop_heartbeat = Event()
 
@@ -762,29 +834,58 @@ class Handler(BaseHTTPRequestHandler):
                     phase = str(progress["phase"])
                     prompt_tokens = int(progress["prompt_tokens"])
                     cached_tokens = int(progress["cached_tokens"])
+                    suffix_tokens = int(progress["suffix_tokens"])
                     output_tokens = int(progress["output_tokens"])
                     max_tokens = int(progress["max_tokens"])
-                percent = 0 if phase == "prefill" else min(99, int(output_tokens * 100 / max(max_tokens, 1)))
                 elapsed = time.monotonic() - started_at
+                cache_percent = min(100, int(cached_tokens * 100 / max(prompt_tokens, 1)))
+                if phase == "prefill":
+                    estimated_prefill_seconds = suffix_tokens / max(self.app.prefill_progress_tokens_per_second, 1)
+                    percent = min(95, int(elapsed * 100 / max(estimated_prefill_seconds, 1)))
+                else:
+                    percent = min(99, int(output_tokens * 100 / max(max_tokens, 1)))
                 LOG.debug(
-                    "stream response id=%s heartbeat progress=%d%% phase=%s elapsed=%.1fs prompt_tokens=%d cached_tokens=%d output_tokens=%d/%d",
+                    "stream response id=%s heartbeat progress=%d%% phase=%s elapsed=%.1fs prompt_tokens=%d cached_tokens=%d cache=%d%% suffix_tokens=%d output_tokens=%d/%d",
                     rid,
                     percent,
                     phase,
                     elapsed,
                     prompt_tokens,
                     cached_tokens,
+                    cache_percent,
+                    suffix_tokens,
                     output_tokens,
                     max_tokens,
                 )
                 try:
+                    heartbeat_payload = {
+                        "type": "response.in_progress",
+                        "response": {
+                            "id": rid,
+                            "status": "in_progress",
+                            "progress": {
+                                "percent": percent,
+                                "phase": phase,
+                                "elapsed_seconds": round(elapsed, 1),
+                                "prompt_tokens": prompt_tokens,
+                                "cached_tokens": cached_tokens,
+                                "cache_percent": cache_percent,
+                                "suffix_tokens": suffix_tokens,
+                                "output_tokens": output_tokens,
+                                "max_tokens": max_tokens,
+                                "estimated": phase == "prefill",
+                            },
+                        },
+                    }
                     write_sse(
                         (
                             f": keep-alive progress={percent}% phase={phase} elapsed={elapsed:.1f}s "
-                            f"output_tokens={output_tokens}/{max_tokens}\n\n"
+                            f"prompt_tokens={prompt_tokens} cached_tokens={cached_tokens} cache={cache_percent}% "
+                            f"suffix_tokens={suffix_tokens} output_tokens={output_tokens}/{max_tokens}\n\n"
                         ).encode()
                     )
-                except OSError:
+                    write_sse(sse(heartbeat_payload))
+                except ClientDisconnected:
                     stop_heartbeat.set()
                     return
 
@@ -793,15 +894,10 @@ class Handler(BaseHTTPRequestHandler):
 
         try:
             with self.app.generation_lock:
-                for text, result in self.app.engine.stream(body):
+                for text, result in self.app.engine.stream(body, progress_callback=update_progress):
                     text_parts.append(text)
                     last_result = result
-                    with progress_lock:
-                        progress["phase"] = "generating"
-                        progress["prompt_tokens"] = result.prompt_tokens
-                        progress["cached_tokens"] = result.cached_tokens
-                        progress["output_tokens"] = result.output_tokens
-                        progress["max_tokens"] = result.max_tokens
+                    update_progress(result, "generating")
                     LOG.debug("stream response id=%s delta=%r output_tokens=%d", rid, text, result.output_tokens)
         finally:
             stop_heartbeat.set()
@@ -817,10 +913,13 @@ class Handler(BaseHTTPRequestHandler):
             last_result.output_tokens,
             preview("".join(text_parts)),
         )
-        write_sse(sse({"type": "response.output_item.added", "output_index": 0, "item": output_item}))
-        write_sse(sse({"type": "response.output_item.done", "output_index": 0, "item": output_item}))
-        write_sse(sse({"type": "response.completed", "response": payload}))
-        write_sse(sse("[DONE]"))
+        try:
+            write_sse(sse({"type": "response.output_item.added", "output_index": 0, "item": output_item}))
+            write_sse(sse({"type": "response.output_item.done", "output_index": 0, "item": output_item}))
+            write_sse(sse({"type": "response.completed", "response": payload}))
+            write_sse(sse("[DONE]"))
+        except ClientDisconnected:
+            LOG.info("client disconnected before final stream events id=%s", rid)
 
 
 def parse_args() -> argparse.Namespace:
@@ -833,7 +932,9 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--max-kv-size", type=int)
     parser.add_argument("--prefill-step-size", type=int, default=512)
     parser.add_argument("--min-output-tokens", type=int, default=2048)
+    parser.add_argument("--analysis-only-token-limit", type=int, default=512)
     parser.add_argument("--stream-heartbeat-interval", type=float, default=15.0)
+    parser.add_argument("--prefill-progress-tokens-per-second", type=float, default=200.0)
     parser.add_argument("-a", "--adaptation", action="store_true", help="Enable Codex/gpt-oss compatibility adaptations")
     parser.add_argument("--mock", action="store_true", help="Run without loading MLX model")
     parser.add_argument("--log-level", default="INFO")
@@ -859,6 +960,7 @@ def main() -> None:
             max_kv_size=args.max_kv_size,
             prefill_step_size=args.prefill_step_size,
             min_output_tokens=args.min_output_tokens,
+            analysis_only_token_limit=args.analysis_only_token_limit,
             adaptation=args.adaptation,
         )
 
@@ -868,6 +970,7 @@ def main() -> None:
         args.model_id,
         adaptation=args.adaptation,
         stream_heartbeat_interval=args.stream_heartbeat_interval,
+        prefill_progress_tokens_per_second=args.prefill_progress_tokens_per_second,
     )  # type: ignore[attr-defined]
     LOG.info("serving %s on http://%s:%s", args.model_id, args.host, args.port)
     httpd.serve_forever()
