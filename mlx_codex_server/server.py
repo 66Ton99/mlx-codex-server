@@ -171,6 +171,7 @@ class GenerationResult:
     prompt_tokens: int
     cached_tokens: int
     output_tokens: int
+    max_tokens: int = 0
 
 
 def parse_tool_call_text(text: str) -> tuple[str, str] | None:
@@ -382,13 +383,13 @@ class MockEngine:
                 '{"patch":"*** Begin Patch\\n*** Add File: mock.txt\\n+OK\\n*** End Patch\\n"}'
                 '<|end|>'
             )
-            return GenerationResult(text, prompt_tokens=16, cached_tokens=cached, output_tokens=16)
+            return GenerationResult(text, prompt_tokens=16, cached_tokens=cached, output_tokens=16, max_tokens=32)
         if self.adaptation and "MOCK_FINAL_HARMONY" in json.dumps(body.get("input", ""), ensure_ascii=False):
             text = (
                 "<|channel|>analysis<|message|>Hidden reasoning.<|end|>"
                 "<|start|>assistant<|channel|>final<|message|>Clean final answer.<|end|>"
             )
-            return GenerationResult(text, prompt_tokens=16, cached_tokens=cached, output_tokens=16)
+            return GenerationResult(text, prompt_tokens=16, cached_tokens=cached, output_tokens=16, max_tokens=32)
         if self.adaptation and "MOCK_EXEC_COMMAND_BRACKET" in json.dumps(body.get("input", ""), ensure_ascii=False):
             text = (
                 "<|channel|>analysis<|message|>Need to commit.<|end|>"
@@ -397,8 +398,8 @@ class MockEngine:
                 '{"cmd":"git add money.js && git commit -m \\"Add money.js orchestrator for core money scripts\\""}'
                 "<|end|>"
             )
-            return GenerationResult(text, prompt_tokens=16, cached_tokens=cached, output_tokens=32)
-        return GenerationResult("OK", prompt_tokens=16, cached_tokens=cached, output_tokens=1)
+            return GenerationResult(text, prompt_tokens=16, cached_tokens=cached, output_tokens=32, max_tokens=64)
+        return GenerationResult("OK", prompt_tokens=16, cached_tokens=cached, output_tokens=1, max_tokens=4)
 
     def stream(self, body: dict[str, Any]):
         if "MOCK_SLOW_STREAM" in json.dumps(body.get("input", ""), ensure_ascii=False):
@@ -478,7 +479,7 @@ class MLXEngine:
     def generate(self, body: dict[str, Any]) -> GenerationResult:
         text = "".join(piece for piece, _ in self.stream(body))
         result = getattr(self, "_last_result")
-        return GenerationResult(text, result.prompt_tokens, result.cached_tokens, result.output_tokens)
+        return GenerationResult(text, result.prompt_tokens, result.cached_tokens, result.output_tokens, result.max_tokens)
 
     def stream(self, body: dict[str, Any]):
         patch_transformers_for_mlx_lm()
@@ -537,7 +538,7 @@ class MLXEngine:
                 LOG.debug("generated token id=%d text=%r", token, text)
             if text:
                 generated.append(text)
-                result = GenerationResult("", len(tokens), cached_tokens, len(generated_token_ids))
+                result = GenerationResult("", len(tokens), cached_tokens, len(generated_token_ids), max_tokens)
                 yield text, result
             finish_reason = getattr(chunk, "finish_reason", None)
             if finish_reason:
@@ -552,6 +553,7 @@ class MLXEngine:
             len(tokens),
             cached_tokens,
             len(generated_token_ids),
+            max_tokens,
         )
 
 
@@ -727,14 +729,49 @@ class Handler(BaseHTTPRequestHandler):
         write_sse(sse({"type": "response.created", "response": {"id": rid, "status": "in_progress"}}))
         text_parts: list[str] = []
         last_result = GenerationResult("", 0, 0, 0)
+        requested_max_tokens = int(body.get("max_output_tokens") or body.get("max_tokens") or 512)
+        engine_min_output_tokens = int(getattr(self.app.engine, "min_output_tokens", requested_max_tokens))
+        expected_max_tokens = max(requested_max_tokens, engine_min_output_tokens) if self.app.adaptation else requested_max_tokens
+        progress = {
+            "phase": "prefill",
+            "prompt_tokens": 0,
+            "cached_tokens": 0,
+            "output_tokens": 0,
+            "max_tokens": expected_max_tokens,
+        }
+        progress_lock = Lock()
+        started_at = time.monotonic()
 
         stop_heartbeat = Event()
 
         def heartbeat() -> None:
             while not stop_heartbeat.wait(self.app.stream_heartbeat_interval):
-                LOG.debug("stream response id=%s heartbeat", rid)
+                with progress_lock:
+                    phase = str(progress["phase"])
+                    prompt_tokens = int(progress["prompt_tokens"])
+                    cached_tokens = int(progress["cached_tokens"])
+                    output_tokens = int(progress["output_tokens"])
+                    max_tokens = int(progress["max_tokens"])
+                percent = 0 if phase == "prefill" else min(99, int(output_tokens * 100 / max(max_tokens, 1)))
+                elapsed = time.monotonic() - started_at
+                LOG.debug(
+                    "stream response id=%s heartbeat progress=%d%% phase=%s elapsed=%.1fs prompt_tokens=%d cached_tokens=%d output_tokens=%d/%d",
+                    rid,
+                    percent,
+                    phase,
+                    elapsed,
+                    prompt_tokens,
+                    cached_tokens,
+                    output_tokens,
+                    max_tokens,
+                )
                 try:
-                    write_sse(b": keep-alive\n\n")
+                    write_sse(
+                        (
+                            f": keep-alive progress={percent}% phase={phase} elapsed={elapsed:.1f}s "
+                            f"output_tokens={output_tokens}/{max_tokens}\n\n"
+                        ).encode()
+                    )
                 except OSError:
                     stop_heartbeat.set()
                     return
@@ -747,6 +784,12 @@ class Handler(BaseHTTPRequestHandler):
                 for text, result in self.app.engine.stream(body):
                     text_parts.append(text)
                     last_result = result
+                    with progress_lock:
+                        progress["phase"] = "generating"
+                        progress["prompt_tokens"] = result.prompt_tokens
+                        progress["cached_tokens"] = result.cached_tokens
+                        progress["output_tokens"] = result.output_tokens
+                        progress["max_tokens"] = result.max_tokens
                     LOG.debug("stream response id=%s delta=%r output_tokens=%d", rid, text, result.output_tokens)
         finally:
             stop_heartbeat.set()

@@ -123,6 +123,7 @@ if [[ "$mock" == 1 ]]; then
     }')"
   echo "$heartbeat_stream"
   echo "$heartbeat_stream" | grep -F ': keep-alive' >/dev/null
+  echo "$heartbeat_stream" | grep -F 'progress=' >/dev/null
   echo "$heartbeat_stream" | grep -F '"type": "response.completed"' >/dev/null
 
   final_response="$(curl -fsS "http://127.0.0.1:${port}/v1/responses" \
