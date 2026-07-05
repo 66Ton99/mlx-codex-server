@@ -427,6 +427,7 @@ class MLXEngine:
         LOG.info("loading MLX model %s from %s", model_id, model_path)
         self.model_id = model_id
         self.model, self.tokenizer = load(model_path)
+        self.cache_model_key = (model_id, id(self.model))
         self.cache_cls = LRUPromptCache
         self.prompt_cache_size = prompt_cache_size
         self.max_kv_size = max_kv_size
@@ -492,7 +493,7 @@ class MLXEngine:
         tokens = self.encode(prompt)
         key = str(body.get("prompt_cache_key") or "default")
         cache_store = self.cache_for(key)
-        cache, rest = cache_store.fetch_nearest_cache(self.model, tokens)
+        cache, rest = cache_store.fetch_nearest_cache(self.cache_model_key, tokens)
         cached_tokens = len(tokens) - len(rest)
         LOG.debug(
             "cache lookup key=%r hit=%s prompt_tokens=%d cached_tokens=%d suffix_tokens=%d",
@@ -551,13 +552,13 @@ class MLXEngine:
         if generated_token_ids and cache_is_trimmable:
             prompt_only_cache = copy.deepcopy(cache)
             trim_prompt_cache(prompt_only_cache, len(generated_token_ids))
-            cache_store.insert_cache(self.model, copy.deepcopy(tokens), prompt_only_cache, cache_type="user")
+            cache_store.insert_cache(self.cache_model_key, copy.deepcopy(tokens), prompt_only_cache, cache_type="user")
             LOG.debug("stored prompt-only cache key=%r prompt_tokens=%d", key, len(tokens))
         elif generated_token_ids:
             LOG.debug("prompt cache key=%r is not trimmable; storing generated sequence only", key)
 
         cache_key = tokens + generated_token_ids
-        cache_store.insert_cache(self.model, copy.deepcopy(cache_key), cache)
+        cache_store.insert_cache(self.cache_model_key, copy.deepcopy(cache_key), cache)
         LOG.debug("stored prompt cache key=%r total_cached_sequence_tokens=%d", key, len(cache_key))
         self._last_result = GenerationResult(
             "".join(generated),
