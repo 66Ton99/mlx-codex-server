@@ -4,6 +4,7 @@ import argparse
 import copy
 import json
 import logging
+import os
 import time
 import uuid
 from dataclasses import dataclass
@@ -18,6 +19,7 @@ from urllib.parse import urlparse
 
 LOG = logging.getLogger("mlx-codex-server")
 DEBUG_PREVIEW_CHARS = 4000
+DEFAULT_CONFIG_PATH = "config.json"
 CODEX_ADAPTATION_REMINDER = (
     "Codex adapter reminder: do not stop after analysis. If workspace inspection or edits are needed, "
     "emit a commentary tool call. If no tool call is needed, emit a final answer. Do not expose analysis "
@@ -922,24 +924,89 @@ class Handler(BaseHTTPRequestHandler):
             LOG.info("client disconnected before final stream events id=%s", rid)
 
 
+def default_config() -> dict[str, Any]:
+    return {
+        "host": os.environ.get("MLX_CODEX_HOST", "127.0.0.1"),
+        "port": int(os.environ.get("MLX_CODEX_PORT", "1234")),
+        "model_path": os.environ.get("MLX_CODEX_MODEL_PATH", "/Users/ton/.cache/lm-studio/models/66Ton99/gpt-oss-120b"),
+        "model_id": os.environ.get("MLX_CODEX_MODEL_ID", "66ton99/gpt-oss-120b"),
+        "prompt_cache_size": 8,
+        "max_kv_size": None,
+        "prefill_step_size": 512,
+        "min_output_tokens": 2048,
+        "analysis_only_token_limit": 512,
+        "stream_heartbeat_interval": 15.0,
+        "prefill_progress_tokens_per_second": 200.0,
+        "adaptation": False,
+        "mock": False,
+        "log_level": "INFO",
+        "debug": False,
+    }
+
+
+def read_config(path: str) -> dict[str, Any]:
+    if not path or not os.path.exists(path):
+        return {}
+    with open(path, "r", encoding="utf-8") as fh:
+        data = json.load(fh)
+    if not isinstance(data, dict):
+        raise ValueError(f"config file {path!r} must contain a JSON object")
+    return data
+
+
+def write_config(path: str, values: dict[str, Any]) -> None:
+    directory = os.path.dirname(os.path.abspath(path))
+    if directory:
+        os.makedirs(directory, exist_ok=True)
+    with open(path, "w", encoding="utf-8") as fh:
+        json.dump(values, fh, ensure_ascii=False, indent=2, sort_keys=True)
+        fh.write("\n")
+
+
+def add_server_arguments(parser: argparse.ArgumentParser, *, default: Any) -> None:
+    parser.add_argument("--host", default=default)
+    parser.add_argument("--port", type=int, default=default)
+    parser.add_argument("--model-path", default=default)
+    parser.add_argument("--model-id", default=default)
+    parser.add_argument("--prompt-cache-size", type=int, default=default)
+    parser.add_argument("--max-kv-size", type=int, default=default)
+    parser.add_argument("--prefill-step-size", type=int, default=default)
+    parser.add_argument("--min-output-tokens", type=int, default=default)
+    parser.add_argument("--analysis-only-token-limit", type=int, default=default)
+    parser.add_argument("--stream-heartbeat-interval", type=float, default=default)
+    parser.add_argument("--prefill-progress-tokens-per-second", type=float, default=default)
+    parser.add_argument("-a", "--adaptation", action=argparse.BooleanOptionalAction, default=default, help="Enable Codex/gpt-oss compatibility adaptations")
+    parser.add_argument("--mock", action=argparse.BooleanOptionalAction, default=default, help="Run without loading MLX model")
+    parser.add_argument("--log-level", default=default)
+    parser.add_argument("-d", "--debug", action=argparse.BooleanOptionalAction, default=default, help="Enable verbose debug logging")
+
+
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="MLX OpenAI Responses server for Codex")
-    parser.add_argument("--host", default="127.0.0.1")
-    parser.add_argument("--port", type=int, default=1234)
-    parser.add_argument("--model-path", default="/Users/ton/.cache/lm-studio/models/66Ton99/gpt-oss-120b")
-    parser.add_argument("--model-id", default="66ton99/gpt-oss-120b")
-    parser.add_argument("--prompt-cache-size", type=int, default=8)
-    parser.add_argument("--max-kv-size", type=int)
-    parser.add_argument("--prefill-step-size", type=int, default=512)
-    parser.add_argument("--min-output-tokens", type=int, default=2048)
-    parser.add_argument("--analysis-only-token-limit", type=int, default=512)
-    parser.add_argument("--stream-heartbeat-interval", type=float, default=15.0)
-    parser.add_argument("--prefill-progress-tokens-per-second", type=float, default=200.0)
-    parser.add_argument("-a", "--adaptation", action="store_true", help="Enable Codex/gpt-oss compatibility adaptations")
-    parser.add_argument("--mock", action="store_true", help="Run without loading MLX model")
-    parser.add_argument("--log-level", default="INFO")
-    parser.add_argument("-d", "--debug", action="store_true", help="Enable verbose debug logging")
-    return parser.parse_args()
+    parser.add_argument("--config", default=os.environ.get("MLX_CODEX_CONFIG", DEFAULT_CONFIG_PATH), help="Path to persistent JSON config")
+    parser.add_argument("--no-save-config", action="store_true", help="Do not update the persistent config from explicit CLI options")
+    add_server_arguments(parser, default=argparse.SUPPRESS)
+
+    raw_args = parser.parse_args()
+    explicit = vars(raw_args).copy()
+    config_path = explicit.pop("config")
+    no_save_config = explicit.pop("no_save_config")
+
+    values = default_config()
+    config_values = read_config(config_path)
+    config_values.pop("mock", None)
+    values.update(config_values)
+    values.update(explicit)
+    values["config"] = config_path
+    values["no_save_config"] = no_save_config
+
+    if explicit and not no_save_config:
+        to_save = {key: values[key] for key in default_config()}
+        to_save["mock"] = False
+        write_config(config_path, to_save)
+        LOG.info("saved server config to %s", config_path)
+
+    return argparse.Namespace(**values)
 
 
 def main() -> None:

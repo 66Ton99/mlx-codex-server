@@ -27,6 +27,9 @@ Useful options:
 ./scripts/run-server --adaptation --stream-heartbeat-interval 15
 ```
 
+Explicit options are saved to `config.json` and reused on later starts. Use
+`--no-save-config` for one-off overrides. The `--mock` flag is never persisted.
+
 Run the lightweight mock smoke test:
 
 ```sh

@@ -11,9 +11,11 @@ fi
 
 port="${MLX_CODEX_PORT:-18000}"
 log="${TMPDIR:-/tmp}/mlx-codex-server-smoke.log"
+config="${TMPDIR:-/tmp}/mlx-codex-server-smoke-config.json"
 rm -f "$log"
+rm -f "$config"
 
-args=(--host 127.0.0.1 --port "$port" --model-id 66ton99/gpt-oss-120b)
+args=(--config "$config" --host 127.0.0.1 --port "$port" --model-id 66ton99/gpt-oss-120b)
 if [[ "$mock" == 1 ]]; then
   args+=(--mock --adaptation --stream-heartbeat-interval 0.05)
 else
@@ -160,8 +162,13 @@ if [[ "$mock" == 1 ]]; then
 from mlx_codex_server.server import response_input_to_messages
 from mlx_codex_server.server import response_text_from_generation
 from mlx_codex_server.server import is_analysis_only_generation
+from mlx_codex_server.server import parse_args
 from mlx_codex_server.server import tool_arguments_for
 from mlx_codex_server.server import tools_for_chat_template
+import json
+import sys
+import tempfile
+from pathlib import Path
 
 messages = response_input_to_messages({
     "input": [
@@ -196,6 +203,37 @@ assert tools[0]["function"]["parameters"]["properties"]["input"]["type"] == "str
 
 arguments = tool_arguments_for("exec_command", "function", '{"cmd":"git add money.js && git commit -m "Add money.js orchestrator for core money scripts""}')
 assert arguments == '{"cmd": "git add money.js && git commit -m \\"Add money.js orchestrator for core money scripts\\""}', arguments
+
+config = Path(tempfile.gettempdir()) / "mlx-codex-server-parse-args-smoke.json"
+config.unlink(missing_ok=True)
+sys.argv = ["smoke", "--config", str(config), "--port", "19001", "--adaptation", "--mock"]
+args = parse_args()
+assert args.port == 19001, args
+assert args.adaptation is True, args
+assert args.mock is True, args
+data = json.loads(config.read_text())
+assert data["port"] == 19001, data
+assert data["adaptation"] is True, data
+assert data["mock"] is False, data
+sys.argv = ["smoke", "--config", str(config)]
+args = parse_args()
+assert args.port == 19001, args
+assert args.adaptation is True, args
+assert args.mock is False, args
+config.unlink(missing_ok=True)
+PY
+fi
+
+if [[ "$mock" == 1 ]]; then
+  python3 - <<PY
+import json
+from pathlib import Path
+
+config = Path("$config")
+assert config.exists(), config
+data = json.loads(config.read_text())
+assert data.get("adaptation") is True, data
+assert data.get("mock") is False, data
 PY
 fi
 
