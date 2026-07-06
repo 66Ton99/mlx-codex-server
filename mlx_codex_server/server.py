@@ -5,6 +5,7 @@ import copy
 import json
 import logging
 import os
+import re
 import time
 import uuid
 from dataclasses import dataclass
@@ -23,7 +24,9 @@ DEFAULT_CONFIG_PATH = "config.json"
 CODEX_ADAPTATION_REMINDER = (
     "Codex adapter reminder: do not stop after analysis. If workspace inspection or edits are needed, "
     "emit a commentary tool call. If no tool call is needed, emit a final answer. Do not expose analysis "
-    "as the visible answer."
+    "as the visible answer. In final answers, avoid LaTeX math delimiters such as \\(...\\), \\[...\\], "
+    "$...$, or $$...$$ because Codex CLI may render them poorly; use plain Markdown text, code spans, "
+    "or fenced code blocks for formulas."
 )
 
 
@@ -294,6 +297,109 @@ def response_text_from_generation(text: str) -> str:
     return "[local model produced analysis-only output without a final answer or tool call]"
 
 
+def normalize_visible_markdown(text: str) -> str:
+    def fenced_formula(content: str) -> str:
+        return f"```text\n{plain_formula_text(content)}\n```"
+
+    def replace_latex_block(match: re.Match[str]) -> str:
+        content = match.group(1).strip()
+        if "\\" not in content:
+            return match.group(0)
+        return fenced_formula(content)
+
+    text = re.sub(r"(?ms)^[ \t]*\[\s*\n(.*?)\n[ \t]*\][ \t]*$", replace_latex_block, text)
+    text = re.sub(r"(?ms)\\\[\s*(.*?)\s*\\\]", lambda match: fenced_formula(match.group(1)), text)
+    text = re.sub(r"(?ms)\$\$\s*(.*?)\s*\$\$", lambda match: fenced_formula(match.group(1)), text)
+    text = re.sub(r"(?m)^[ \t]*\[\s*(\\[^\n]+?)\s*\][ \t]*$", replace_latex_block, text)
+    return fence_bare_latex_lines(text)
+
+
+def fence_bare_latex_lines(text: str) -> str:
+    lines = text.splitlines()
+    output: list[str] = []
+    pending: list[str] = []
+    in_fence = False
+
+    def flush_pending() -> None:
+        if not pending:
+            return
+        output.append("```text")
+        output.extend(plain_formula_text(line) for line in pending)
+        output.append("```")
+        pending.clear()
+
+    for line in lines:
+        stripped = line.strip()
+        if stripped.startswith("```"):
+            flush_pending()
+            in_fence = not in_fence
+            output.append(line)
+            continue
+        if not in_fence and is_bare_latex_line(stripped):
+            pending.append(line)
+            continue
+        flush_pending()
+        output.append(line)
+
+    flush_pending()
+    return "\n".join(output)
+
+
+def plain_formula_text(text: str) -> str:
+    text = text.strip()
+    text = re.sub(r"\\text\{([^{}]*)\}", r"\1", text)
+    text = re.sub(r"\\boxed\{([^{}]*)\}", r"\1", text)
+    text = re.sub(r"\\begin\{[^{}]*\}", "", text)
+    text = re.sub(r"\\end\{[^{}]*\}", "", text)
+    replacements = {
+        "\\times": "*",
+        "\\cdot": "*",
+        "\\approx": "≈",
+        "\\,": ",",
+        "\\!": "",
+        "\\left": "",
+        "\\right": "",
+        "\\bigl": "",
+        "\\bigr": "",
+    }
+    for old, new in replacements.items():
+        text = text.replace(old, new)
+    text = text.replace("\\\\", "")
+    text = text.replace("\\", "")
+    text = text.replace("&=", "=")
+    text = text.replace("&", "")
+    text = re.sub(r"[ \t]+", " ", text)
+    text = re.sub(r"\s+,", ",", text)
+    return text.strip()
+
+
+def is_bare_latex_line(line: str) -> bool:
+    if not line:
+        return False
+    latex_markers = (
+        "\\text",
+        "\\begin",
+        "\\end",
+        "\\log",
+        "\\times",
+        "\\approx",
+        "\\boxed",
+        "\\frac",
+        "\\cdot",
+        "\\bigl",
+        "\\bigr",
+        "\\,",
+        "\\!",
+    )
+    if any(marker in line for marker in latex_markers):
+        return True
+    return line.startswith("&") and "\\" in line
+
+
+def visible_response_text_from_generation(text: str) -> str:
+    return normalize_visible_markdown(response_text_from_generation(text))
+
+
 def is_analysis_only_generation(text: str) -> bool:
     if parse_tool_call_text(text) is not None:
         return False
@@ -430,6 +536,15 @@ class MockEngine:
                 "<|end|>"
             )
             return GenerationResult(text, prompt_tokens=16, cached_tokens=cached, output_tokens=32, max_tokens=64)
+        if "MOCK_LATEX_BLOCK" in json.dumps(body.get("input", ""), ensure_ascii=False):
+            text = (
+                "<|channel|>final<|message|>"
+                "Formula:\n\n"
+                "  [\n"
+                "  \\text{cost}(L) = 10^{9} \\times 1.9^{L-1}\n"
+                "  ]"
+            )
+            return GenerationResult(text, prompt_tokens=16, cached_tokens=cached, output_tokens=32, max_tokens=64)
         return GenerationResult("OK", prompt_tokens=16, cached_tokens=cached, output_tokens=1, max_tokens=4)
 
     def stream(self, body: dict[str, Any], progress_callback: Callable[[GenerationResult, str], None] | None = None):
@@ -552,6 +667,8 @@ class MLXEngine:
         max_tokens = max(requested_max_tokens, self.min_output_tokens) if self.adaptation else requested_max_tokens
         generated: list[str] = []
         generated_token_ids: list[int] = []
+        cache_token_ids: list[int] = []
+        analysis_only_stopped = False
 
         LOG.info(
             "request prompt_cache_key=%r prompt_tokens=%d cached_tokens=%d suffix_tokens=%d max_tokens=%d requested_max_tokens=%d",
@@ -577,7 +694,7 @@ class MLXEngine:
             token = getattr(chunk, "token", None)
             if isinstance(token, int):
                 generated_token_ids.append(token)
-                LOG.debug("generated token id=%d text=%r", token, text)
+                cache_token_ids.append(token)
             if text:
                 generated.append(text)
                 result = GenerationResult("", len(tokens), cached_tokens, len(generated_token_ids), max_tokens)
@@ -592,22 +709,34 @@ class MLXEngine:
                     "stopping analysis-only generation after %d token(s); no final answer or tool call detected",
                     len(generated_token_ids),
                 )
+                analysis_only_stopped = True
                 break
             finish_reason = getattr(chunk, "finish_reason", None)
             if finish_reason:
                 LOG.debug("generation finish_reason=%r", finish_reason)
                 break
 
+        if analysis_only_stopped:
+            fallback_final = (
+                "<|end|><|start|>assistant<|channel|>final<|message|>"
+                "Local model stopped after producing analysis-only output. No tool call was emitted, so no files were "
+                "changed. Please retry the request, lower --analysis-only-token-limit, or switch to a model/profile that "
+                "emits commentary tool calls or final answers reliably."
+            )
+            generated.append(fallback_final)
+            yield fallback_final, GenerationResult("", len(tokens), cached_tokens, len(generated_token_ids), max_tokens)
+            LOG.info("inserted deterministic final fallback after analysis-only stop")
+
         cache_is_trimmable = can_trim_prompt_cache(cache)
         if generated_token_ids and cache_is_trimmable:
             prompt_only_cache = copy.deepcopy(cache)
-            trim_prompt_cache(prompt_only_cache, len(generated_token_ids))
+            trim_prompt_cache(prompt_only_cache, len(cache_token_ids))
             cache_store.insert_cache(self.cache_model_key, copy.deepcopy(tokens), prompt_only_cache, cache_type="user")
             LOG.debug("stored prompt-only cache key=%r prompt_tokens=%d", key, len(tokens))
         elif generated_token_ids:
             LOG.debug("prompt cache key=%r is not trimmable; storing generated sequence only", key)
 
-        cache_key = tokens + generated_token_ids
+        cache_key = tokens + cache_token_ids
         cache_store.insert_cache(self.cache_model_key, copy.deepcopy(cache_key), cache)
         LOG.debug("stored prompt cache key=%r total_cached_sequence_tokens=%d", key, len(cache_key))
         self._last_result = GenerationResult(
@@ -746,7 +875,11 @@ class Handler(BaseHTTPRequestHandler):
             "content": [
                 {
                     "type": "output_text",
-                    "text": response_text_from_generation(text) if self.app.adaptation else text,
+                    "text": (
+                        visible_response_text_from_generation(text)
+                        if self.app.adaptation
+                        else normalize_visible_markdown(text)
+                    ),
                     "annotations": [],
                 }
             ],
@@ -900,7 +1033,6 @@ class Handler(BaseHTTPRequestHandler):
                     text_parts.append(text)
                     last_result = result
                     update_progress(result, "generating")
-                    LOG.debug("stream response id=%s delta=%r output_tokens=%d", rid, text, result.output_tokens)
         finally:
             stop_heartbeat.set()
             heartbeat_worker.join(timeout=1)
@@ -995,6 +1127,7 @@ def parse_args() -> argparse.Namespace:
     values = default_config()
     config_values = read_config(config_path)
     config_values.pop("mock", None)
+    config_values.pop("analysis_only_rescue_tokens", None)
     values.update(config_values)
     values.update(explicit)
     values["config"] = config_path

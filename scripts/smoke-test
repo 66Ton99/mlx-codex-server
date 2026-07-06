@@ -162,10 +162,27 @@ if [[ "$mock" == 1 ]]; then
   echo "$exec_response" | jq -e '.output[0].name == "exec_command"' >/dev/null
   echo "$exec_response" | jq -e '.output[0].arguments | fromjson | .cmd == "git add money.js && git commit -m \"Add money.js orchestrator for core money scripts\""' >/dev/null
 
+  latex_response="$(curl -fsS "http://127.0.0.1:${port}/v1/responses" \
+    -H 'content-type: application/json' \
+    -d '{
+      "model": "66ton99/gpt-oss-120b",
+      "prompt_cache_key": "smoke-latex-block",
+      "input": "MOCK_LATEX_BLOCK",
+      "max_output_tokens": 64,
+      "stream": false
+    }')"
+  echo "$latex_response" | jq .
+  echo "$latex_response" | jq -e '.output[0].content[0].text | contains("```text")' >/dev/null
+  echo "$latex_response" | jq -e '.output[0].content[0].text | contains("[\n  \\\\text") | not' >/dev/null
+  echo "$latex_response" | jq -e '.output[0].content[0].text | contains("\\\\text") | not' >/dev/null
+  echo "$latex_response" | jq -e '.output[0].content[0].text | contains("\\\\times") | not' >/dev/null
+
   python3 - <<'PY'
 from mlx_codex_server.server import response_input_to_messages
 from mlx_codex_server.server import response_text_from_generation
+from mlx_codex_server.server import CODEX_ADAPTATION_REMINDER
 from mlx_codex_server.server import is_analysis_only_generation
+from mlx_codex_server.server import visible_response_text_from_generation
 from mlx_codex_server.server import parse_args
 from mlx_codex_server.server import tool_arguments_for
 from mlx_codex_server.server import tools_for_chat_template
@@ -197,6 +214,52 @@ visible = response_text_from_generation("<|channel|>analysis<|message|>thinking 
 assert visible.startswith("[local model produced analysis-only output"), visible
 visible = response_text_from_generation("<|channel|>final<|message|>done")
 assert visible == "done", visible
+visible = response_text_from_generation(
+    "<|channel|>analysis<|message|>thinking<|end|>"
+    "<|start|>assistant<|channel|>final<|message|>"
+    "<|end|><|start|>assistant<|channel|>final<|message|>deterministic"
+)
+assert visible == "deterministic", visible
+visible = response_text_from_generation(
+    "<|channel|>analysis<|message|>thinking"
+    "<|end|><|start|>assistant<|channel|>final<|message|>"
+    "Local model stopped after producing analysis-only output. No tool call was emitted, so no files were changed."
+)
+assert "No tool call was emitted" in visible, visible
+visible = visible_response_text_from_generation(
+    "<|channel|>final<|message|>Formula:\n\n"
+    "[\n"
+    "\\text{cost}(L) = 10^{9} \\times 1.9^{L-1}\n"
+    "]\n\n"
+    "\\[\n"
+    "\\boxed{6.36 \\times 10^{79}}\n"
+    "\\]\n\n"
+    "$$\\log_{10}(1.9)$$\n\n"
+    "[\\boxed{6.36 \\times 10^{79}}]"
+)
+assert "cost" in visible, visible
+assert "```text" in visible, visible
+assert "[\n\\text" not in visible, visible
+assert "\\[" not in visible, visible
+assert "$$" not in visible, visible
+assert "[\\boxed" not in visible, visible
+assert "\\text" not in visible, visible
+assert "\\times" not in visible, visible
+assert "\\boxed" not in visible, visible
+visible = visible_response_text_from_generation(
+    "<|channel|>final<|message|>Formula:\n\n"
+    "\\text{cost}(L) = 10^{9} \\times 1.9^{L-1}\n\n"
+    "Для L = 255:\n\n"
+    "\\begin{aligned}\n"
+    "\\text{cost}(255) &= 10^{9} \\times 1.9^{254} \\\\\n"
+    "\\log_{10}\\!\\bigl(\\text{cost}(255)\\bigr) &= 9 + 254 \\times \\log_{10}(1.9) \\\\\n"
+    "\\end{aligned}\n"
+)
+assert visible.count("```text") == 2, visible
+assert "\\begin{aligned}" not in visible, visible
+assert "\\text" not in visible, visible
+assert "\\times" not in visible, visible
+assert "Formula:\n\n```text" in visible, visible
 assert is_analysis_only_generation("<|channel|>analysis<|message|>thinking only"), "analysis-only was not detected"
 assert not is_analysis_only_generation("<|channel|>commentary<|message|>I will check files."), "commentary was treated as analysis-only"
 assert not is_analysis_only_generation('[tool call (exec_command, ls)]\n{"cmd":"ls"}'), "tool call was treated as analysis-only"
@@ -207,6 +270,7 @@ assert tools[0]["function"]["parameters"]["properties"]["input"]["type"] == "str
 
 arguments = tool_arguments_for("exec_command", "function", '{"cmd":"git add money.js && git commit -m "Add money.js orchestrator for core money scripts""}')
 assert arguments == '{"cmd": "git add money.js && git commit -m \\"Add money.js orchestrator for core money scripts\\""}', arguments
+assert "avoid LaTeX math delimiters" in CODEX_ADAPTATION_REMINDER, CODEX_ADAPTATION_REMINDER
 
 config = Path(tempfile.gettempdir()) / "mlx-codex-server-parse-args-smoke.json"
 config.unlink(missing_ok=True)

@@ -1,0 +1,59 @@
+{
+  "models": [
+    {
+      "slug": "66ton99/gpt-oss-120b",
+      "display_name": "GPT-OSS-120B (MLX Codex Server)",
+      "description": "Local gpt-oss-120b served by mlx-codex-server through the OpenAI Responses API.",
+      "default_reasoning_level": "high",
+      "supported_reasoning_levels": [
+        {
+          "effort": "low",
+          "description": "Fast responses with lighter reasoning"
+        },
+        {
+          "effort": "medium",
+          "description": "Balanced local reasoning"
+        },
+        {
+          "effort": "high",
+          "description": "Maximum local reasoning for this model"
+        }
+      ],
+      "shell_type": "shell_command",
+      "visibility": "list",
+      "supported_in_api": true,
+      "priority": 20,
+      "additional_speed_tiers": [],
+      "service_tiers": [],
+      "availability_nux": null,
+      "upgrade": null,
+      "model_messages": {
+        "instructions_template": "You are Codex, a coding agent. Work directly in the user local workspace, keep changes scoped, and verify your work.\n\nIn final answers, do not use raw LaTeX math. Do not write formulas with \\(...\\), \\[...\\], $...$, $$...$$, \\begin{...}, \\text{...}, \\times, \\approx, or \\boxed{...} as visible prose. Use plain Markdown, inline code spans, or fenced ```text code blocks for formulas.\n\n{{ personality }}",
+        "instructions_variables": {
+          "personality_default": "",
+          "personality_pragmatic": "# Personality\n\nYou are a pragmatic software engineering assistant. Communicate clearly, keep the user informed about concrete actions, and verify changes before reporting completion."
+        }
+      },
+      "supports_reasoning_summaries": false,
+      "default_reasoning_summary": "none",
+      "support_verbosity": false,
+      "apply_patch_tool_type": "freeform",
+      "truncation_policy": {
+        "mode": "tokens",
+        "limit": 10000
+      },
+      "supports_parallel_tool_calls": false,
+      "supports_image_detail_original": false,
+      "context_window": 272000,
+      "max_context_window": 272000,
+      "effective_context_window_percent": 95,
+      "experimental_supported_tools": [],
+      "input_modalities": [
+        "text"
+      ],
+      "supports_search_tool": false,
+      "use_responses_lite": false,
+      "base_instructions": "You are Codex, a coding agent. Work directly in the user local workspace, keep changes scoped, and verify your work. In final answers, do not use raw LaTeX math. Use plain Markdown, inline code spans, or fenced ```text code blocks for formulas."
+    }
+  ]
+}

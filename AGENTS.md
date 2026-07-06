@@ -20,6 +20,13 @@ server routes those requests to the same local prompt-cache namespace.
 The local Python environment lives in `.venv/` and is intentionally ignored by
 git. `nix-shell` creates and syncs it automatically.
 
+## Repository Hygiene
+
+Do not commit machine-specific absolute paths such as local home directories,
+volume mount points, model-cache paths, or workspace roots. Use environment
+variables, relative paths, placeholders, or local symlinks outside the repository
+for machine-specific configuration.
+
 ## Setup
 
 ```sh
@@ -57,19 +64,24 @@ Before launching the real 120B model, unload the same model from LM Studio. Do
 not keep LM Studio and this server serving `gpt-oss-120b` at the same time unless
 you deliberately want two copies of the model resident in memory.
 
+When starting the server from automation, tests, or one-off local verification,
+include `--no-save-config`. This is especially important when passing a local
+`--model-path`, because machine-specific paths must not be persisted into
+`config.json`.
+
 ```sh
 nix-shell
-./scripts/run-server
+./scripts/run-server --no-save-config
 ```
 
 Useful variants:
 
 ```sh
 MLX_CODEX_PORT=18000 ./scripts/run-server
-./scripts/run-server --adaptation
-./scripts/run-server --prompt-cache-size 4
-./scripts/run-server --max-kv-size 4096
-./scripts/run-server --log-level DEBUG
+./scripts/run-server --no-save-config --adaptation
+./scripts/run-server --no-save-config --prompt-cache-size 4
+./scripts/run-server --no-save-config --max-kv-size 4096
+./scripts/run-server --no-save-config --log-level DEBUG
 ```
 
 Health check:

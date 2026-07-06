@@ -1,0 +1,19 @@
+model = "66ton99/gpt-oss-120b"
+model_provider = "mlx-codex"
+model_catalog_json = "model-catalogs/with-mlx-codex-gpt-oss-120b.json"
+approvals_reviewer = "user"
+model_reasoning_effort = "high"
+personality = "pragmatic"
+include_permissions_instructions = false
+include_apps_instructions = false
+include_collaboration_mode_instructions = false
+include_environment_context = false
+
+[skills]
+include_instructions = false
+
+[tui]
+status_line = ["model-with-reasoning", "current-dir", "run-state", "permissions", "context-remaining", "task-progress"]
+status_line_use_colors = true
+
+# Keep one active generation request for this 120B local model.
